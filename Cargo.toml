@@ -1,0 +1,12 @@
+[package]
+name = "particle_life"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nannou = "0.20"
+bytemuck = { version = "1", features = ["derive"] }
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
