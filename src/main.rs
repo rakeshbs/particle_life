@@ -150,6 +150,49 @@ fn grid_cell_rect(origin: (f32, f32), row: u32, col: u32) -> UiRect {
     }
 }
 
+fn push_triangle(
+    verts: &mut Vec<UiVertex>,
+    p0: (f32, f32),
+    p1: (f32, f32),
+    p2: (f32, f32),
+    color: [f32; 4],
+    half_w: f32,
+    half_h: f32,
+) {
+    let c = |x: f32, y: f32| [x / half_w, y / half_h];
+    verts.push(UiVertex { clip_pos: c(p0.0, p0.1), color });
+    verts.push(UiVertex { clip_pos: c(p1.0, p1.1), color });
+    verts.push(UiVertex { clip_pos: c(p2.0, p2.1), color });
+}
+
+// Downward chevron overlay for column headers ("read down this column").
+fn push_down_chevron(verts: &mut Vec<UiVertex>, rect: &UiRect, color: [f32; 4], half_w: f32, half_h: f32) {
+    let cx = (rect.x0 + rect.x1) * 0.5;
+    push_triangle(
+        verts,
+        (cx, rect.y0 + 3.0),
+        (cx - 5.0, rect.y1 - 3.0),
+        (cx + 5.0, rect.y1 - 3.0),
+        color,
+        half_w,
+        half_h,
+    );
+}
+
+// Rightward chevron overlay for row headers ("read across this row").
+fn push_right_chevron(verts: &mut Vec<UiVertex>, rect: &UiRect, color: [f32; 4], half_w: f32, half_h: f32) {
+    let cy = (rect.y0 + rect.y1) * 0.5;
+    push_triangle(
+        verts,
+        (rect.x1 - 3.0, cy),
+        (rect.x0 + 3.0, cy + 5.0),
+        (rect.x0 + 3.0, cy - 5.0),
+        color,
+        half_w,
+        half_h,
+    );
+}
+
 fn push_rect(verts: &mut Vec<UiVertex>, rect: &UiRect, color: [f32; 4], half_w: f32, half_h: f32) {
     let c = |x: f32, y: f32| [x / half_w, y / half_h];
     let p00 = c(rect.x0, rect.y0);
@@ -553,11 +596,18 @@ fn update(app: &App, model: &mut Model) {
     };
     push_rect(&mut ui_vertices, &handle_rect, [1.0, 1.0, 1.0, 0.9], half_w, half_h);
 
+    // Column headers get a downward chevron ("read down this column"); row
+    // headers get a rightward chevron ("read across this row") — a text-free
+    // way to show which axis is "from" and which is "to" in the matrix.
+    const CHEVRON_COLOR: [f32; 4] = [0.05, 0.05, 0.05, 0.85];
     for i in 0..num_types {
         let rect_col = grid_cell_rect(layout.grid_origin, 0, i + 1);
         push_rect(&mut ui_vertices, &rect_col, type_color_rgb(i), half_w, half_h);
+        push_down_chevron(&mut ui_vertices, &rect_col, CHEVRON_COLOR, half_w, half_h);
+
         let rect_row = grid_cell_rect(layout.grid_origin, i + 1, 0);
         push_rect(&mut ui_vertices, &rect_row, type_color_rgb(i), half_w, half_h);
+        push_right_chevron(&mut ui_vertices, &rect_row, CHEVRON_COLOR, half_w, half_h);
     }
     for row in 0..num_types {
         for col in 0..num_types {
