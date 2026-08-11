@@ -16,6 +16,10 @@ struct Params {
     particle_radius: f32,
     num_types: u32,
     num_particles: u32,
+    cell_size: f32,
+    grid_cols: u32,
+    grid_rows: u32,
+    num_cells: u32,
 };
 
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;

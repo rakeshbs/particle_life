@@ -4,9 +4,12 @@ use std::sync::Arc;
 
 const WINDOW_W: u32 = 1280;
 const WINDOW_H: u32 = 720;
-const NUM_PARTICLES: u32 = 4000;
+const NUM_PARTICLES: u32 = 400_000;
 const NUM_TYPES: u32 = 6;
 const WORKGROUP_SIZE: u32 = 64;
+// Spatial grid cell size for neighbor search. Must be >= max_radius so the
+// 3x3 neighborhood always covers the full interaction radius.
+const CELL_SIZE: f32 = 80.0;
 // Speed slider multiplies this base; can go as low as 1/32 of it.
 const BASE_FORCE_SCALE: f32 = 75.0;
 const SPEED_MULT_MIN: f32 = 1.0 / 32.0;
@@ -44,6 +47,10 @@ struct Params {
     particle_radius: f32,
     num_types: u32,
     num_particles: u32,
+    cell_size: f32,
+    grid_cols: u32,
+    grid_rows: u32,
+    num_cells: u32,
 }
 
 #[repr(C)]
@@ -238,7 +245,12 @@ fn matrix_value_color(v: f32) -> [f32; 4] {
 
 #[derive(Clone)]
 struct Model {
-    compute_pipeline: Arc<wgpu::ComputePipeline>,
+    clear_counts_pipeline: Arc<wgpu::ComputePipeline>,
+    count_pipeline: Arc<wgpu::ComputePipeline>,
+    prefix_sum_pipeline: Arc<wgpu::ComputePipeline>,
+    scatter_pipeline: Arc<wgpu::ComputePipeline>,
+    force_pipeline: Arc<wgpu::ComputePipeline>,
+    num_cells: u32,
     compute_bind_groups: [Arc<wgpu::BindGroup>; 2],
     render_pipeline: Arc<wgpu::RenderPipeline>,
     render_bind_groups: [Arc<wgpu::BindGroup>; 2],
@@ -301,6 +313,10 @@ fn model(app: &App) -> Model {
     let particles = random_particles(&mut rng, NUM_PARTICLES, NUM_TYPES, half_w, half_h);
     let matrix = random_matrix(&mut rng, NUM_TYPES);
 
+    let grid_cols = (WINDOW_W as f32 / CELL_SIZE).ceil() as u32;
+    let grid_rows = (WINDOW_H as f32 / CELL_SIZE).ceil() as u32;
+    let num_cells = grid_cols * grid_rows;
+
     let params = Params {
         half_width: half_w,
         half_height: half_h,
@@ -312,6 +328,10 @@ fn model(app: &App) -> Model {
         particle_radius: 2.5,
         num_types: NUM_TYPES,
         num_particles: NUM_PARTICLES,
+        cell_size: CELL_SIZE,
+        grid_cols,
+        grid_rows,
+        num_cells,
     };
 
     let particle_buf_size = std::num::NonZeroU64::new(
@@ -345,15 +365,43 @@ fn model(app: &App) -> Model {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
-    // --- compute pipeline ---
-    let cs_desc = wgpu::include_wgsl!("shaders/compute.wgsl");
+    // --- spatial-grid compute pipeline (5 passes: clear, count, prefix sum,
+    // scatter, force) sharing one bind group layout and one shader module ---
+    let cs_desc = wgpu::include_wgsl!("shaders/grid_compute.wgsl");
     let cs_mod = device.create_shader_module(cs_desc);
 
+    let cell_counts_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cell-counts"),
+        size: (num_cells as usize * std::mem::size_of::<u32>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let cell_offsets_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cell-offsets"),
+        size: (num_cells as usize * std::mem::size_of::<u32>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let sorted_indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sorted-indices"),
+        size: (NUM_PARTICLES as usize * std::mem::size_of::<u32>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let cell_counts_buf_size =
+        std::num::NonZeroU64::new((num_cells as usize * std::mem::size_of::<u32>()) as u64).unwrap();
+    let sorted_indices_buf_size =
+        std::num::NonZeroU64::new((NUM_PARTICLES as usize * std::mem::size_of::<u32>()) as u64)
+            .unwrap();
+
     let compute_bgl = wgpu::BindGroupLayoutBuilder::new()
-        .uniform_buffer(wgpu::ShaderStages::COMPUTE, false)
-        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, true) // matrix (read-only)
-        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, true) // particles_in (read-only)
-        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // particles_out (read-write)
+        .uniform_buffer(wgpu::ShaderStages::COMPUTE, false) // 0: params
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, true) // 1: matrix (read-only)
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, true) // 2: particles_in (read-only)
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // 3: particles_out (read-write)
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // 4: cell_counts (read-write)
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // 5: cell_offsets (read-write)
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // 6: sorted_indices (read-write)
         .build(&device);
 
     let compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -361,14 +409,22 @@ fn model(app: &App) -> Model {
         bind_group_layouts: &[Some(&compute_bgl)],
         immediate_size: 0,
     });
-    let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("particle-life-compute"),
-        layout: Some(&compute_pipeline_layout),
-        module: &cs_mod,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
+
+    let make_compute_pipeline = |label: &str, entry_point: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&compute_pipeline_layout),
+            module: &cs_mod,
+            entry_point: Some(entry_point),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let clear_counts_pipeline = make_compute_pipeline("particle-life-clear-counts", "clear_counts");
+    let count_pipeline = make_compute_pipeline("particle-life-count", "count_particles");
+    let prefix_sum_pipeline = make_compute_pipeline("particle-life-prefix-sum", "prefix_sum");
+    let scatter_pipeline = make_compute_pipeline("particle-life-scatter", "scatter_particles");
+    let force_pipeline = make_compute_pipeline("particle-life-force", "compute_forces");
 
     let make_compute_bind_group = |in_buf: &wgpu::Buffer, out_buf: &wgpu::Buffer| {
         wgpu::BindGroupBuilder::new()
@@ -376,6 +432,9 @@ fn model(app: &App) -> Model {
             .buffer_bytes(&matrix_buffer, 0, Some(matrix_buf_size))
             .buffer_bytes(in_buf, 0, Some(particle_buf_size))
             .buffer_bytes(out_buf, 0, Some(particle_buf_size))
+            .buffer_bytes(&cell_counts_buffer, 0, Some(cell_counts_buf_size))
+            .buffer_bytes(&cell_offsets_buffer, 0, Some(cell_counts_buf_size))
+            .buffer_bytes(&sorted_indices_buffer, 0, Some(sorted_indices_buf_size))
             .build(&device, &compute_bgl)
     };
     let compute_bind_group_0 = make_compute_bind_group(&particle_buffer_a, &particle_buffer_b);
@@ -449,7 +508,12 @@ fn model(app: &App) -> Model {
     });
 
     Model {
-        compute_pipeline: Arc::new(compute_pipeline),
+        clear_counts_pipeline: Arc::new(clear_counts_pipeline),
+        count_pipeline: Arc::new(count_pipeline),
+        prefix_sum_pipeline: Arc::new(prefix_sum_pipeline),
+        scatter_pipeline: Arc::new(scatter_pipeline),
+        force_pipeline: Arc::new(force_pipeline),
+        num_cells,
         compute_bind_groups: [Arc::new(compute_bind_group_0), Arc::new(compute_bind_group_1)],
         render_pipeline: Arc::new(render_pipeline),
         render_bind_groups: [Arc::new(render_bind_group_0), Arc::new(render_bind_group_1)],
@@ -636,16 +700,36 @@ fn update(app: &App, model: &mut Model) {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("particle-life-compute"),
     });
-    {
+    let bind_group = &*model.compute_bind_groups[model.current];
+    let particle_workgroups = (model.params.num_particles + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+    let cell_workgroups = (model.num_cells + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+
+    let dispatch = |encoder: &mut wgpu::CommandEncoder,
+                     label: &str,
+                     pipeline: &wgpu::ComputePipeline,
+                     workgroups: u32| {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("particle-life-compute-pass"),
+            label: Some(label),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(&model.compute_pipeline);
-        cpass.set_bind_group(0, &*model.compute_bind_groups[model.current], &[]);
-        let workgroups = (model.params.num_particles + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        cpass.set_pipeline(pipeline);
+        cpass.set_bind_group(0, bind_group, &[]);
         cpass.dispatch_workgroups(workgroups, 1, 1);
-    }
+    };
+
+    // 1. Zero the per-cell histogram.
+    dispatch(&mut encoder, "clear-counts", &model.clear_counts_pipeline, cell_workgroups);
+    // 2. Count particles per cell.
+    dispatch(&mut encoder, "count-particles", &model.count_pipeline, particle_workgroups);
+    // 3. Exclusive prefix sum -> per-cell start offsets.
+    dispatch(&mut encoder, "prefix-sum", &model.prefix_sum_pipeline, 1);
+    // 4. Zero counts again, to reuse as a per-cell write cursor.
+    dispatch(&mut encoder, "clear-counts-2", &model.clear_counts_pipeline, cell_workgroups);
+    // 5. Scatter particle indices into cell-sorted order.
+    dispatch(&mut encoder, "scatter-particles", &model.scatter_pipeline, particle_workgroups);
+    // 6. Force pass: each particle only checks its 3x3 neighboring cells.
+    dispatch(&mut encoder, "compute-forces", &model.force_pipeline, particle_workgroups);
+
     window.queue().submit(Some(encoder.finish()));
     model.current = 1 - model.current;
 }
