@@ -20,6 +20,7 @@ struct Params {
     grid_cols: u32,
     grid_rows: u32,
     num_cells: u32,
+    max_cell_scan: u32,
 };
 
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;

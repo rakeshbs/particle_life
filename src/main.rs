@@ -10,6 +10,12 @@ const WORKGROUP_SIZE: u32 = 64;
 // Spatial grid cell size for neighbor search. Must be >= max_radius so the
 // 3x3 neighborhood always covers the full interaction radius.
 const CELL_SIZE: f32 = 80.0;
+// Hard cap on particles checked per neighbor cell. Particle Life clusters
+// particles by design, so a handful of cells can end up wildly overpopulated
+// once clumps form; this bounds worst-case per-particle cost regardless.
+// Chosen so worst case (9 cells * cap) lands near the pair budget that ran
+// comfortably at 40k brute-force particles (~1.6e9 pairs/frame).
+const MAX_CELL_SCAN: u32 = 400;
 // Speed slider multiplies this base; can go as low as 1/32 of it.
 const BASE_FORCE_SCALE: f32 = 75.0;
 const SPEED_MULT_MIN: f32 = 1.0 / 32.0;
@@ -51,6 +57,7 @@ struct Params {
     grid_cols: u32,
     grid_rows: u32,
     num_cells: u32,
+    max_cell_scan: u32,
 }
 
 #[repr(C)]
@@ -332,6 +339,7 @@ fn model(app: &App) -> Model {
         grid_cols,
         grid_rows,
         num_cells,
+        max_cell_scan: MAX_CELL_SCAN,
     };
 
     let particle_buf_size = std::num::NonZeroU64::new(

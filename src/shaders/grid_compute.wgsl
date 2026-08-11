@@ -20,6 +20,7 @@ struct Params {
     grid_cols: u32,
     grid_rows: u32,
     num_cells: u32,
+    max_cell_scan: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -127,7 +128,11 @@ fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
             let ncy = u32((i32(home.y) + dy + rows) % rows);
             let cell = ncy * params.grid_cols + ncx;
             let start = cell_offsets[cell];
-            let count = atomicLoad(&cell_counts[cell]);
+            // Particle Life makes particles cluster by design, so a handful of
+            // cells can end up wildly overpopulated once clumps form. Cap how
+            // many of a cell's particles get checked so worst-case cost per
+            // particle stays bounded regardless of clustering.
+            let count = min(atomicLoad(&cell_counts[cell]), params.max_cell_scan);
 
             for (var k: u32 = 0u; k < count; k = k + 1u) {
                 let j = sorted_indices[start + k];
