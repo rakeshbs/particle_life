@@ -264,7 +264,6 @@ struct Model {
     quad_vertex_buffer: Arc<wgpu::Buffer>,
     matrix_buffer: Arc<wgpu::Buffer>,
     params_buffer: Arc<wgpu::Buffer>,
-    particle_buffers: [Arc<wgpu::Buffer>; 2],
     ui_pipeline: Arc<wgpu::RenderPipeline>,
     ui_vertex_buffer: Arc<wgpu::Buffer>,
     ui_vertex_count: u32,
@@ -727,7 +726,6 @@ fn model(app: &App) -> Model {
         quad_vertex_buffer: Arc::new(quad_vertex_buffer),
         matrix_buffer: Arc::new(matrix_buffer),
         params_buffer: Arc::new(params_buffer),
-        particle_buffers: [Arc::new(particle_buffer_a), Arc::new(particle_buffer_b)],
         ui_pipeline: Arc::new(ui_pipeline),
         ui_vertex_buffer: Arc::new(ui_vertex_buffer),
         ui_vertex_count: 0,
@@ -751,7 +749,6 @@ fn update(app: &App, model: &mut Model) {
         model.paused = !model.paused;
     }
 
-    let reseed_positions = app.keys().just_pressed(KeyCode::KeyR);
     let randomize_matrix_key = app.keys().just_pressed(KeyCode::KeyR);
     let cycle_preset = app.keys().just_pressed(KeyCode::Space);
     let mut matrix_changed = false;
@@ -837,24 +834,6 @@ fn update(app: &App, model: &mut Model) {
             .queue()
             .write_buffer(&model.matrix_buffer, 0, bytemuck::cast_slice(&model.matrix));
     }
-    if reseed_positions {
-        let particles = random_particles(
-            &mut rng,
-            model.params.num_particles,
-            model.params.num_types,
-            model.params.half_width,
-            model.params.half_height,
-        );
-        let particle_bytes = bytemuck::cast_slice(&particles);
-        window
-            .queue()
-            .write_buffer(&model.particle_buffers[0], 0, particle_bytes);
-        window
-            .queue()
-            .write_buffer(&model.particle_buffers[1], 0, particle_bytes);
-        model.current = 0;
-    }
-
     // --- rebuild the UI overlay geometry every frame (even while paused) ---
     let mut ui_vertices: Vec<UiVertex> = Vec::with_capacity(UI_MAX_VERTICES);
 
