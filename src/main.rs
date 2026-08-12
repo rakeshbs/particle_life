@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 const WINDOW_W: u32 = 1280;
 const WINDOW_H: u32 = 720;
-const NUM_PARTICLES: u32 = 400_000;
+const NUM_PARTICLES: u32 = 20_000;
 const NUM_TYPES: u32 = 6;
 const WORKGROUP_SIZE: u32 = 64;
 // Spatial grid cell size for neighbor search. Must be >= max_radius so the
@@ -531,7 +531,7 @@ fn model(app: &App) -> Model {
         max_radius: 80.0,
         beta: 0.3,
         force_scale: BASE_FORCE_SCALE,
-        particle_radius: 2.5,
+        particle_radius: 2.0,
         num_types: NUM_TYPES,
         num_particles: NUM_PARTICLES,
         cell_size: CELL_SIZE,
