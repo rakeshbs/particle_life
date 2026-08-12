@@ -277,6 +277,7 @@ struct Model {
     dragging_cell: Option<usize>,
     drag_start_value: f32,
     drag_start_mouse_y: f32,
+    preset_index: usize,
 }
 
 fn main() {
@@ -298,6 +299,97 @@ fn random_matrix(rng: &mut impl Rng, num_types: u32) -> Vec<f32> {
     (0..num_types * num_types)
         .map(|_| rng.gen_range(-1.0f32..1.0))
         .collect()
+}
+
+const PRESET_COUNT: usize = 6;
+
+// Each type strongly chases the next type around the ring and flees the one
+// chasing it, producing cascading orbit/chain-like motion.
+fn preset_chase_chain(n: u32) -> Vec<f32> {
+    (0..n * n)
+        .map(|idx| {
+            let a = idx / n;
+            let b = idx % n;
+            if b == (a + 1) % n {
+                0.9
+            } else if b == (a + n - 1) % n {
+                -0.9
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+// Strong self-attraction, mutual repulsion between different types: forms
+// distinct, well-separated blobs per type.
+fn preset_cells(n: u32) -> Vec<f32> {
+    (0..n * n)
+        .map(|idx| {
+            let a = idx / n;
+            let b = idx % n;
+            if a == b { 0.7 } else { -0.5 }
+        })
+        .collect()
+}
+
+// Types pair up (0<->1, 2<->3, ...) and strongly attract their partner while
+// repelling everyone else.
+fn preset_symbiosis(n: u32) -> Vec<f32> {
+    (0..n * n)
+        .map(|idx| {
+            let a = idx / n;
+            let b = idx % n;
+            let partner = if a % 2 == 0 { a + 1 } else { a - 1 };
+            if a == b {
+                0.3
+            } else if b == partner && partner < n {
+                0.8
+            } else {
+                -0.3
+            }
+        })
+        .collect()
+}
+
+// Deterministic pseudo-random full-range matrix (fixed "designed chaos"
+// rather than a fresh random reseed each time).
+fn preset_chaos(n: u32) -> Vec<f32> {
+    (0..n * n)
+        .map(|idx| {
+            let a = (idx / n) as f32;
+            let b = (idx % n) as f32;
+            let v = ((a * 12.9898 + b * 78.233).sin() * 43758.5453).fract();
+            v * 2.0 - 1.0
+        })
+        .collect()
+}
+
+// Everyone repels everyone: particles disperse and stay spread out.
+fn preset_repulsive_gas(n: u32) -> Vec<f32> {
+    (0..n * n)
+        .map(|idx| {
+            let a = idx / n;
+            let b = idx % n;
+            if a == b { -0.3 } else { -0.7 }
+        })
+        .collect()
+}
+
+// Universal mutual attraction: everything collapses into one big cohesive blob.
+fn preset_big_blob(n: u32) -> Vec<f32> {
+    vec![0.5; (n * n) as usize]
+}
+
+fn preset_matrix(index: usize, num_types: u32) -> Vec<f32> {
+    match index % PRESET_COUNT {
+        0 => preset_chase_chain(num_types),
+        1 => preset_cells(num_types),
+        2 => preset_symbiosis(num_types),
+        3 => preset_chaos(num_types),
+        4 => preset_repulsive_gas(num_types),
+        _ => preset_big_blob(num_types),
+    }
 }
 
 fn model(app: &App) -> Model {
@@ -541,18 +633,20 @@ fn model(app: &App) -> Model {
         dragging_cell: None,
         drag_start_value: 0.0,
         drag_start_mouse_y: 0.0,
+        preset_index: 0,
     }
 }
 
 fn update(app: &App, model: &mut Model) {
     let window = app.main_window();
 
-    if app.keys().just_pressed(KeyCode::Space) {
+    if app.keys().just_pressed(KeyCode::KeyP) {
         model.paused = !model.paused;
     }
 
     let reseed_positions = app.keys().just_pressed(KeyCode::KeyR);
     let randomize_matrix_key = app.keys().just_pressed(KeyCode::KeyR);
+    let cycle_preset = app.keys().just_pressed(KeyCode::Space);
     let mut matrix_changed = false;
     let mut speed_changed = false;
 
@@ -624,6 +718,11 @@ fn update(app: &App, model: &mut Model) {
     let mut rng = rand::thread_rng();
     if randomize_matrix_key {
         model.matrix = random_matrix(&mut rng, model.params.num_types);
+        matrix_changed = true;
+    }
+    if cycle_preset {
+        model.preset_index = (model.preset_index + 1) % PRESET_COUNT;
+        model.matrix = preset_matrix(model.preset_index, model.params.num_types);
         matrix_changed = true;
     }
     if matrix_changed {
