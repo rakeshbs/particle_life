@@ -120,6 +120,7 @@ fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
     let home = cell_coords(p.pos);
     let cols = i32(params.grid_cols);
     let rows = i32(params.grid_rows);
+    let max_radius_sq = params.max_radius * params.max_radius;
 
     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
         for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
@@ -146,8 +147,13 @@ fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (d.y > params.half_height) { d.y = d.y - world_h; }
                 else if (d.y < -params.half_height) { d.y = d.y + world_h; }
 
-                let dist = length(d);
-                if (dist > 0.0001 && dist < params.max_radius) {
+                // Cheap squared-distance filter first: skips the sqrt (and the
+                // matrix lookup / force curve) entirely for the common case of
+                // a pair outside the interaction radius, which is most pairs
+                // checked near the edges of the 3x3 cell block.
+                let dist_sq = dot(d, d);
+                if (dist_sq > 0.00000001 && dist_sq < max_radius_sq) {
+                    let dist = sqrt(dist_sq);
                     let a = matrix[p.ptype * params.num_types + o.ptype];
                     let f = attraction(dist / params.max_radius, a, params.beta);
                     accel = accel + (d / dist) * f;
