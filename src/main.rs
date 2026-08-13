@@ -221,14 +221,33 @@ fn push_rect(verts: &mut Vec<UiVertex>, rect: &UiRect, color: [f32; 4], half_w: 
     verts.push(UiVertex { clip_pos: p01, color });
 }
 
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
+    let c = v * s;
+    let hp = h * 6.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let rgb = if hp < 1.0 {
+        [c, x, 0.0]
+    } else if hp < 2.0 {
+        [x, c, 0.0]
+    } else if hp < 3.0 {
+        [0.0, c, x]
+    } else if hp < 4.0 {
+        [0.0, x, c]
+    } else if hp < 5.0 {
+        [x, 0.0, c]
+    } else {
+        [c, 0.0, x]
+    };
+    let m = v - c;
+    [rgb[0] + m, rgb[1] + m, rgb[2] + m]
+}
+
 // Golden-angle hue spread, matching type_color() in vs.wgsl, so the grid's
 // header swatches match the particle colors on screen. Desaturated toward
 // gray so the headers read as a legend rather than competing for attention.
 fn type_color_rgb(t: u32) -> [f32; 4] {
-    let hue = t as f32 * 2.399963;
-    let r = 0.5 + 0.5 * hue.cos();
-    let g = 0.5 + 0.5 * (hue + 2.094395).cos();
-    let b = 0.5 + 0.5 * (hue + 4.18879).cos();
+    let hue = (t as f32 * 0.6180339887).fract();
+    let [r, g, b] = hsv_to_rgb(hue, 0.85, 1.0);
     let sat = 0.55;
     let gray = 0.55;
     [
@@ -239,15 +258,21 @@ fn type_color_rgb(t: u32) -> [f32; 4] {
     ]
 }
 
-// Diverging scale for matrix cells: red (repel) -> dark (neutral) -> green (attract).
+// Muted diverging scale for matrix cells: dark neutral gray at 0, soft rust
+// toward repel, soft teal toward attract.
 fn matrix_value_color(v: f32) -> [f32; 4] {
-    if v >= 0.0 {
-        let t = v.clamp(0.0, 1.0);
-        [20.0 / 255.0, (20.0 + t * 200.0) / 255.0, 60.0 / 255.0, 1.0]
-    } else {
-        let t = (-v).clamp(0.0, 1.0);
-        [(20.0 + t * 200.0) / 255.0, 20.0 / 255.0, 40.0 / 255.0, 1.0]
-    }
+    const NEUTRAL: [f32; 3] = [0.24, 0.24, 0.27];
+    const POS: [f32; 3] = [0.25, 0.55, 0.48];
+    const NEG: [f32; 3] = [0.55, 0.30, 0.28];
+    let t = v.clamp(-1.0, 1.0);
+    let target = if t >= 0.0 { POS } else { NEG };
+    let a = t.abs();
+    [
+        NEUTRAL[0] + (target[0] - NEUTRAL[0]) * a,
+        NEUTRAL[1] + (target[1] - NEUTRAL[1]) * a,
+        NEUTRAL[2] + (target[2] - NEUTRAL[2]) * a,
+        1.0,
+    ]
 }
 
 #[derive(Clone)]
@@ -931,9 +956,9 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
     let mut encoder = frame.command_encoder();
     let mut render_pass = wgpu::RenderPassBuilder::new()
         .color_attachment_descriptor(frame.color_attachment(wgpu::LoadOp::Clear(wgpu::Color {
-            r: 0.03,
-            g: 0.03,
-            b: 0.05,
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
             a: 1.0,
         })))
         .begin(&mut encoder);

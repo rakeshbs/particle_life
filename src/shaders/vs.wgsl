@@ -32,14 +32,27 @@ struct VertexOutput {
     @location(1) color: vec3<f32>,
 };
 
-// Golden-angle hue spread so adjacent type indices get visually distinct colors.
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
+    let c = v * s;
+    let hp = h * 6.0;
+    let x = c * (1.0 - abs(hp % 2.0 - 1.0));
+    var rgb: vec3<f32>;
+    if (hp < 1.0) { rgb = vec3<f32>(c, x, 0.0); }
+    else if (hp < 2.0) { rgb = vec3<f32>(x, c, 0.0); }
+    else if (hp < 3.0) { rgb = vec3<f32>(0.0, c, x); }
+    else if (hp < 4.0) { rgb = vec3<f32>(0.0, x, c); }
+    else if (hp < 5.0) { rgb = vec3<f32>(x, 0.0, c); }
+    else { rgb = vec3<f32>(c, 0.0, x); }
+    let m = v - c;
+    return rgb + vec3<f32>(m, m, m);
+}
+
+// Golden-angle hue spread (via the golden ratio conjugate) so adjacent type
+// indices land on maximally distinct hues; full saturation/value for vivid
+// colors that read clearly against a black background.
 fn type_color(t: u32) -> vec3<f32> {
-    let hue = f32(t) * 2.399963;
-    return vec3<f32>(
-        0.5 + 0.5 * cos(hue),
-        0.5 + 0.5 * cos(hue + 2.094395),
-        0.5 + 0.5 * cos(hue + 4.18879),
-    );
+    let hue = fract(f32(t) * 0.6180339887);
+    return hsv_to_rgb(hue, 0.85, 1.0);
 }
 
 @vertex
