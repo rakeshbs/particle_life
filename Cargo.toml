@@ -7,6 +7,7 @@ edition = "2021"
 nannou = "0.20"
 bytemuck = { version = "1", features = ["derive"] }
 rand = "0.8"
+bevy_window = "0.19"
 
 [profile.release]
 opt-level = 3

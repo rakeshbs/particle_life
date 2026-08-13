@@ -4076,6 +4076,7 @@ dependencies = [
 name = "particle_life"
 version = "0.1.0"
 dependencies = [
+ "bevy_window",
  "bytemuck",
  "nannou",
  "rand 0.8.7",

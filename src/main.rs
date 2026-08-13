@@ -1,3 +1,4 @@
+use bevy_window::{Window as BevyWindow, WindowMode};
 use nannou::prelude::*;
 use rand::Rng;
 use std::sync::Arc;
@@ -16,7 +17,8 @@ const CELL_SIZE: f32 = 80.0;
 // Chosen so worst case (9 cells * cap) lands near the pair budget that ran
 // comfortably at 40k brute-force particles (~1.6e9 pairs/frame).
 const MAX_CELL_SCAN: u32 = 400;
-// Speed slider multiplies this base; can go as low as 1/32 of it.
+// Default force scale (1/4 of the previous 300.0 default). The speed slider
+// multiplies this, and can go as low as 1/32 of it.
 const BASE_FORCE_SCALE: f32 = 75.0;
 const SPEED_MULT_MIN: f32 = 1.0 / 32.0;
 const SPEED_MULT_MAX: f32 = 2.0;
@@ -282,6 +284,8 @@ struct Model {
     prefix_sum_pipeline: Arc<wgpu::ComputePipeline>,
     scatter_pipeline: Arc<wgpu::ComputePipeline>,
     force_pipeline: Arc<wgpu::ComputePipeline>,
+    compute_bgl: Arc<wgpu::BindGroupLayout>,
+    render_bgl: Arc<wgpu::BindGroupLayout>,
     num_cells: u32,
     compute_bind_groups: [Arc<wgpu::BindGroup>; 2],
     render_pipeline: Arc<wgpu::RenderPipeline>,
@@ -302,6 +306,9 @@ struct Model {
     drag_start_value: f32,
     drag_start_mouse_y: f32,
     preset_index: usize,
+    fullscreen: bool,
+    pending_resize: bool,
+    density: f32,
 }
 
 fn main() {
@@ -523,13 +530,120 @@ fn preset_matrix(index: usize, num_types: u32) -> Vec<f32> {
     }
 }
 
+// Everything that depends on particle count / window size: the particle
+// buffers, the spatial-grid scratch buffers (sized off the grid dimensions,
+// which depend on window size), and the bind groups that reference them.
+// Pulled out so it can be called both at startup and again on a fullscreen
+// resize, without re-creating the (size-independent) pipelines/shaders.
+struct ParticleResources {
+    compute_bind_group_0: wgpu::BindGroup,
+    compute_bind_group_1: wgpu::BindGroup,
+    render_bind_group_0: wgpu::BindGroup,
+    render_bind_group_1: wgpu::BindGroup,
+    grid_cols: u32,
+    grid_rows: u32,
+    num_cells: u32,
+}
+
+fn build_particle_resources(
+    device: &wgpu::Device,
+    compute_bgl: &wgpu::BindGroupLayout,
+    render_bgl: &wgpu::BindGroupLayout,
+    params_buffer: &wgpu::Buffer,
+    matrix_buffer: &wgpu::Buffer,
+    matrix_buf_size: std::num::NonZeroU64,
+    half_w: f32,
+    half_h: f32,
+    num_particles: u32,
+    num_types: u32,
+    rng: &mut impl Rng,
+) -> ParticleResources {
+    let grid_cols = (half_w * 2.0 / CELL_SIZE).ceil() as u32;
+    let grid_rows = (half_h * 2.0 / CELL_SIZE).ceil() as u32;
+    let num_cells = grid_cols * grid_rows;
+
+    let particles = random_particles(rng, num_particles, num_types, half_w, half_h);
+    let particle_buf_size =
+        std::num::NonZeroU64::new((num_particles as usize * std::mem::size_of::<Particle>()) as u64)
+            .unwrap();
+
+    let particle_bytes = bytemuck::cast_slice(&particles);
+    let particle_buffer_a = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("particles-a"),
+        contents: particle_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    let particle_buffer_b = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("particles-b"),
+        contents: particle_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let cell_counts_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cell-counts"),
+        size: (num_cells as usize * std::mem::size_of::<u32>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let cell_offsets_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cell-offsets"),
+        size: (num_cells as usize * std::mem::size_of::<u32>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let sorted_indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sorted-indices"),
+        size: (num_particles as usize * std::mem::size_of::<u32>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let cell_counts_buf_size =
+        std::num::NonZeroU64::new((num_cells as usize * std::mem::size_of::<u32>()) as u64).unwrap();
+    let sorted_indices_buf_size =
+        std::num::NonZeroU64::new((num_particles as usize * std::mem::size_of::<u32>()) as u64)
+            .unwrap();
+
+    let make_compute_bind_group = |in_buf: &wgpu::Buffer, out_buf: &wgpu::Buffer| {
+        wgpu::BindGroupBuilder::new()
+            .buffer::<Params>(params_buffer, 0..1)
+            .buffer_bytes(matrix_buffer, 0, Some(matrix_buf_size))
+            .buffer_bytes(in_buf, 0, Some(particle_buf_size))
+            .buffer_bytes(out_buf, 0, Some(particle_buf_size))
+            .buffer_bytes(&cell_counts_buffer, 0, Some(cell_counts_buf_size))
+            .buffer_bytes(&cell_offsets_buffer, 0, Some(cell_counts_buf_size))
+            .buffer_bytes(&sorted_indices_buffer, 0, Some(sorted_indices_buf_size))
+            .build(device, compute_bgl)
+    };
+    let compute_bind_group_0 = make_compute_bind_group(&particle_buffer_a, &particle_buffer_b);
+    let compute_bind_group_1 = make_compute_bind_group(&particle_buffer_b, &particle_buffer_a);
+
+    let make_render_bind_group = |buf: &wgpu::Buffer| {
+        wgpu::BindGroupBuilder::new()
+            .buffer_bytes(buf, 0, Some(particle_buf_size))
+            .buffer::<Params>(params_buffer, 0..1)
+            .build(device, render_bgl)
+    };
+    let render_bind_group_0 = make_render_bind_group(&particle_buffer_a);
+    let render_bind_group_1 = make_render_bind_group(&particle_buffer_b);
+
+    ParticleResources {
+        compute_bind_group_0,
+        compute_bind_group_1,
+        render_bind_group_0,
+        render_bind_group_1,
+        grid_cols,
+        grid_rows,
+        num_cells,
+    }
+}
+
 fn model(app: &App) -> Model {
     let w_id = app
         .new_window::<Model>()
         .primary()
         .size(WINDOW_W, WINDOW_H)
         .title("Particle Life")
-        .resizable(false)
+        .resizable(true)
         .hdr(true)
         .build();
 
@@ -540,7 +654,6 @@ fn model(app: &App) -> Model {
     let half_h = WINDOW_H as f32 * 0.5;
 
     let mut rng = rand::thread_rng();
-    let particles = random_particles(&mut rng, NUM_PARTICLES, NUM_TYPES, half_w, half_h);
     let matrix = random_matrix(&mut rng, NUM_TYPES);
 
     let grid_cols = (WINDOW_W as f32 / CELL_SIZE).ceil() as u32;
@@ -565,24 +678,8 @@ fn model(app: &App) -> Model {
         max_cell_scan: MAX_CELL_SCAN,
     };
 
-    let particle_buf_size = std::num::NonZeroU64::new(
-        (NUM_PARTICLES as usize * std::mem::size_of::<Particle>()) as u64,
-    )
-    .unwrap();
     let matrix_buf_size =
         std::num::NonZeroU64::new((matrix.len() * std::mem::size_of::<f32>()) as u64).unwrap();
-
-    let particle_bytes = bytemuck::cast_slice(&particles);
-    let particle_buffer_a = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("particles-a"),
-        contents: particle_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-    });
-    let particle_buffer_b = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("particles-b"),
-        contents: particle_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-    });
 
     let matrix_buffer = device.create_buffer_init(&BufferInitDescriptor {
         label: Some("interaction-matrix"),
@@ -600,30 +697,6 @@ fn model(app: &App) -> Model {
     // scatter, force) sharing one bind group layout and one shader module ---
     let cs_desc = wgpu::include_wgsl!("shaders/grid_compute.wgsl");
     let cs_mod = device.create_shader_module(cs_desc);
-
-    let cell_counts_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cell-counts"),
-        size: (num_cells as usize * std::mem::size_of::<u32>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-    let cell_offsets_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cell-offsets"),
-        size: (num_cells as usize * std::mem::size_of::<u32>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-    let sorted_indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("sorted-indices"),
-        size: (NUM_PARTICLES as usize * std::mem::size_of::<u32>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-    let cell_counts_buf_size =
-        std::num::NonZeroU64::new((num_cells as usize * std::mem::size_of::<u32>()) as u64).unwrap();
-    let sorted_indices_buf_size =
-        std::num::NonZeroU64::new((NUM_PARTICLES as usize * std::mem::size_of::<u32>()) as u64)
-            .unwrap();
 
     let compute_bgl = wgpu::BindGroupLayoutBuilder::new()
         .uniform_buffer(wgpu::ShaderStages::COMPUTE, false) // 0: params
@@ -657,20 +730,6 @@ fn model(app: &App) -> Model {
     let scatter_pipeline = make_compute_pipeline("particle-life-scatter", "scatter_particles");
     let force_pipeline = make_compute_pipeline("particle-life-force", "compute_forces");
 
-    let make_compute_bind_group = |in_buf: &wgpu::Buffer, out_buf: &wgpu::Buffer| {
-        wgpu::BindGroupBuilder::new()
-            .buffer::<Params>(&params_buffer, 0..1)
-            .buffer_bytes(&matrix_buffer, 0, Some(matrix_buf_size))
-            .buffer_bytes(in_buf, 0, Some(particle_buf_size))
-            .buffer_bytes(out_buf, 0, Some(particle_buf_size))
-            .buffer_bytes(&cell_counts_buffer, 0, Some(cell_counts_buf_size))
-            .buffer_bytes(&cell_offsets_buffer, 0, Some(cell_counts_buf_size))
-            .buffer_bytes(&sorted_indices_buffer, 0, Some(sorted_indices_buf_size))
-            .build(&device, &compute_bgl)
-    };
-    let compute_bind_group_0 = make_compute_bind_group(&particle_buffer_a, &particle_buffer_b);
-    let compute_bind_group_1 = make_compute_bind_group(&particle_buffer_b, &particle_buffer_a);
-
     // --- particle render pipeline ---
     let vs_desc = wgpu::include_wgsl!("shaders/vs.wgsl");
     let fs_desc = wgpu::include_wgsl!("shaders/fs.wgsl");
@@ -694,15 +753,6 @@ fn model(app: &App) -> Model {
         .add_vertex_buffer::<QuadVertex>(&wgpu::vertex_attr_array![0 => Float32x2])
         .sample_count(window.msaa_samples())
         .build(&device);
-
-    let make_render_bind_group = |buf: &wgpu::Buffer| {
-        wgpu::BindGroupBuilder::new()
-            .buffer_bytes(buf, 0, Some(particle_buf_size))
-            .buffer::<Params>(&params_buffer, 0..1)
-            .build(&device, &render_bgl)
-    };
-    let render_bind_group_0 = make_render_bind_group(&particle_buffer_a);
-    let render_bind_group_1 = make_render_bind_group(&particle_buffer_b);
 
     let quad_vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
         label: Some("quad-vertices"),
@@ -738,16 +788,38 @@ fn model(app: &App) -> Model {
         mapped_at_creation: false,
     });
 
+    let particle_res = build_particle_resources(
+        &device,
+        &compute_bgl,
+        &render_bgl,
+        &params_buffer,
+        &matrix_buffer,
+        matrix_buf_size,
+        half_w,
+        half_h,
+        NUM_PARTICLES,
+        NUM_TYPES,
+        &mut rng,
+    );
+
     Model {
         clear_counts_pipeline: Arc::new(clear_counts_pipeline),
         count_pipeline: Arc::new(count_pipeline),
         prefix_sum_pipeline: Arc::new(prefix_sum_pipeline),
         scatter_pipeline: Arc::new(scatter_pipeline),
         force_pipeline: Arc::new(force_pipeline),
+        compute_bgl: Arc::new(compute_bgl),
+        render_bgl: Arc::new(render_bgl),
         num_cells,
-        compute_bind_groups: [Arc::new(compute_bind_group_0), Arc::new(compute_bind_group_1)],
+        compute_bind_groups: [
+            Arc::new(particle_res.compute_bind_group_0),
+            Arc::new(particle_res.compute_bind_group_1),
+        ],
         render_pipeline: Arc::new(render_pipeline),
-        render_bind_groups: [Arc::new(render_bind_group_0), Arc::new(render_bind_group_1)],
+        render_bind_groups: [
+            Arc::new(particle_res.render_bind_group_0),
+            Arc::new(particle_res.render_bind_group_1),
+        ],
         quad_vertex_buffer: Arc::new(quad_vertex_buffer),
         matrix_buffer: Arc::new(matrix_buffer),
         params_buffer: Arc::new(params_buffer),
@@ -764,6 +836,9 @@ fn model(app: &App) -> Model {
         drag_start_value: 0.0,
         drag_start_mouse_y: 0.0,
         preset_index: 0,
+        fullscreen: false,
+        pending_resize: false,
+        density: NUM_PARTICLES as f32 / (WINDOW_W as f32 * WINDOW_H as f32),
     }
 }
 
@@ -772,6 +847,81 @@ fn update(app: &App, model: &mut Model) {
 
     if app.keys().just_pressed(KeyCode::KeyP) {
         model.paused = !model.paused;
+    }
+
+    if app.keys().just_pressed(KeyCode::KeyF) {
+        model.fullscreen = !model.fullscreen;
+        let going_fullscreen = model.fullscreen;
+        let window_entity = app.window_id();
+        app.command_scope(move |mut commands| {
+            commands
+                .entity(window_entity)
+                .entry::<BevyWindow>()
+                .and_modify(move |mut w| {
+                    w.mode = if going_fullscreen {
+                        WindowMode::BorderlessFullscreen(MonitorSelection::Primary)
+                    } else {
+                        WindowMode::Windowed
+                    };
+                });
+        });
+        // The mode change takes a frame or more to actually resize the
+        // window; poll each frame below until the observed size changes,
+        // then rebuild the particle/grid buffers for the new dimensions.
+        model.pending_resize = true;
+    }
+
+    if model.pending_resize {
+        let rect = window.rect();
+        let new_half_w = rect.w() * 0.5;
+        let new_half_h = rect.h() * 0.5;
+        if (new_half_w - model.params.half_width).abs() > 0.5
+            || (new_half_h - model.params.half_height).abs() > 0.5
+        {
+            let device = window.device();
+            let new_num_particles =
+                ((model.density * rect.w() * rect.h()).round() as u32).max(100);
+            let matrix_buf_size = std::num::NonZeroU64::new(
+                (model.matrix.len() * std::mem::size_of::<f32>()) as u64,
+            )
+            .unwrap();
+            let mut rng = rand::thread_rng();
+            let particle_res = build_particle_resources(
+                device,
+                &model.compute_bgl,
+                &model.render_bgl,
+                &model.params_buffer,
+                &model.matrix_buffer,
+                matrix_buf_size,
+                new_half_w,
+                new_half_h,
+                new_num_particles,
+                model.params.num_types,
+                &mut rng,
+            );
+
+            model.params.half_width = new_half_w;
+            model.params.half_height = new_half_h;
+            model.params.num_particles = new_num_particles;
+            model.params.grid_cols = particle_res.grid_cols;
+            model.params.grid_rows = particle_res.grid_rows;
+            model.params.num_cells = particle_res.num_cells;
+            model.num_cells = particle_res.num_cells;
+            window
+                .queue()
+                .write_buffer(&model.params_buffer, 0, bytemuck::bytes_of(&model.params));
+
+            model.compute_bind_groups = [
+                Arc::new(particle_res.compute_bind_group_0),
+                Arc::new(particle_res.compute_bind_group_1),
+            ];
+            model.render_bind_groups = [
+                Arc::new(particle_res.render_bind_group_0),
+                Arc::new(particle_res.render_bind_group_1),
+            ];
+            model.current = 0;
+            model.pending_resize = false;
+        }
     }
 
     let randomize_matrix_key = app.keys().just_pressed(KeyCode::KeyR);
@@ -817,8 +967,8 @@ fn update(app: &App, model: &mut Model) {
     }
 
     // Value tracks the drag absolutely (start value + offset from the drag's
-    // starting point), matching the slider above, rather than accumulating
-    // per-frame deltas which feels disconnected from the cursor.
+    // starting point), the same principle as the slider above, rather than
+    // accumulating per-frame deltas which feels disconnected from the cursor.
     if mouse_down {
         if let Some(idx) = model.dragging_cell {
             const DRAG_RANGE: f32 = 120.0;
@@ -897,6 +1047,7 @@ fn update(app: &App, model: &mut Model) {
             let rect = grid_cell_rect(layout.grid_origin, row + 1, col + 1);
             let mut color = matrix_value_color(model.matrix[idx]);
             if model.dragging_cell == Some(idx) {
+                // Brighten the cell currently being dragged for clear feedback.
                 for c in color.iter_mut().take(3) {
                     *c = (*c + 0.35).min(1.0);
                 }
