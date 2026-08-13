@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 const WINDOW_W: u32 = 1280;
 const WINDOW_H: u32 = 720;
-const NUM_PARTICLES: u32 = 20_000;
+const NUM_PARTICLES: u32 = 12_000;
 const NUM_TYPES: u32 = 6;
 const WORKGROUP_SIZE: u32 = 64;
 // Spatial grid cell size for neighbor search. Must be >= max_radius so the
