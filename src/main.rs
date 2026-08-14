@@ -1,7 +1,11 @@
+mod presets;
+mod ui;
+
 use bevy_window::{Window as BevyWindow, WindowMode};
 use nannou::prelude::*;
 use rand::Rng;
 use std::sync::Arc;
+use ui::{UiLayout, UiVertex};
 
 const WINDOW_W: u32 = 1280;
 const WINDOW_H: u32 = 720;
@@ -36,16 +40,6 @@ const MAX_CELL_SCAN: u32 = 400;
 const BASE_FORCE_SCALE: f32 = 75.0;
 const SPEED_MULT_MIN: f32 = 1.0 / 32.0;
 const SPEED_MULT_MAX: f32 = 2.0;
-
-// On-screen control panel layout, in the same pixel/world units as particle
-// positions (window is not resizable, so fixed pixel geometry is fine).
-const UI_MARGIN: f32 = 16.0;
-const UI_CELL: f32 = 22.0;
-const UI_GAP: f32 = 3.0;
-const UI_SLIDER_W: f32 = 200.0;
-const UI_SLIDER_H: f32 = 10.0;
-const UI_ROW_GAP: f32 = 18.0;
-const UI_MAX_VERTICES: usize = 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -100,206 +94,6 @@ const QUAD_VERTICES: [QuadVertex; 6] = [
     QuadVertex { corner: [-1.0, 1.0] },
 ];
 
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct UiVertex {
-    clip_pos: [f32; 2],
-    color: [f32; 4],
-}
-
-#[derive(Clone, Copy)]
-struct UiRect {
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-}
-
-impl UiRect {
-    fn contains(&self, p: Vec2) -> bool {
-        p.x >= self.x0 && p.x <= self.x1 && p.y >= self.y0 && p.y <= self.y1
-    }
-}
-
-struct UiLayout {
-    slider_hit: UiRect,
-    slider_track: UiRect,
-    slider_x0: f32,
-    slider_x1: f32,
-    slider_y_center: f32,
-    grid_origin: (f32, f32),
-    panel_bg: UiRect,
-}
-
-fn compute_ui_layout(half_w: f32, half_h: f32, num_types: u32) -> UiLayout {
-    let panel_left = -half_w + UI_MARGIN;
-    let panel_top = half_h - UI_MARGIN;
-
-    let slider_x0 = panel_left;
-    let slider_x1 = panel_left + UI_SLIDER_W;
-    let slider_y_center = panel_top - UI_SLIDER_H * 0.5;
-    let slider_track = UiRect {
-        x0: slider_x0,
-        x1: slider_x1,
-        y0: slider_y_center - UI_SLIDER_H * 0.5,
-        y1: slider_y_center + UI_SLIDER_H * 0.5,
-    };
-    let slider_hit = UiRect {
-        x0: slider_x0 - 4.0,
-        x1: slider_x1 + 4.0,
-        y0: slider_y_center - 10.0,
-        y1: slider_y_center + 10.0,
-    };
-
-    let grid_top = slider_y_center - UI_SLIDER_H * 0.5 - UI_ROW_GAP;
-    let grid_origin = (panel_left, grid_top);
-
-    let grid_cols = num_types + 1;
-    let grid_rows = num_types + 1;
-    let grid_w = grid_cols as f32 * UI_CELL + (grid_cols - 1) as f32 * UI_GAP;
-    let grid_h = grid_rows as f32 * UI_CELL + (grid_rows - 1) as f32 * UI_GAP;
-    let panel_bg = UiRect {
-        x0: panel_left - 10.0,
-        x1: (panel_left + grid_w).max(slider_x1) + 10.0,
-        y0: grid_top - grid_h - 10.0,
-        y1: panel_top + 10.0,
-    };
-
-    UiLayout {
-        slider_hit,
-        slider_track,
-        slider_x0,
-        slider_x1,
-        slider_y_center,
-        grid_origin,
-        panel_bg,
-    }
-}
-
-// row 0 / col 0 are the type-color header swatches; interior cells (row,col
-// both >= 1) are the actual interaction-matrix entries.
-fn grid_cell_rect(origin: (f32, f32), row: u32, col: u32) -> UiRect {
-    let x0 = origin.0 + col as f32 * (UI_CELL + UI_GAP);
-    let y1 = origin.1 - row as f32 * (UI_CELL + UI_GAP);
-    UiRect {
-        x0,
-        x1: x0 + UI_CELL,
-        y0: y1 - UI_CELL,
-        y1,
-    }
-}
-
-fn push_triangle(
-    verts: &mut Vec<UiVertex>,
-    p0: (f32, f32),
-    p1: (f32, f32),
-    p2: (f32, f32),
-    color: [f32; 4],
-    half_w: f32,
-    half_h: f32,
-) {
-    let c = |x: f32, y: f32| [x / half_w, y / half_h];
-    verts.push(UiVertex { clip_pos: c(p0.0, p0.1), color });
-    verts.push(UiVertex { clip_pos: c(p1.0, p1.1), color });
-    verts.push(UiVertex { clip_pos: c(p2.0, p2.1), color });
-}
-
-// Downward chevron overlay for column headers ("read down this column").
-fn push_down_chevron(verts: &mut Vec<UiVertex>, rect: &UiRect, color: [f32; 4], half_w: f32, half_h: f32) {
-    let cx = (rect.x0 + rect.x1) * 0.5;
-    push_triangle(
-        verts,
-        (cx, rect.y0 + 3.0),
-        (cx - 5.0, rect.y1 - 3.0),
-        (cx + 5.0, rect.y1 - 3.0),
-        color,
-        half_w,
-        half_h,
-    );
-}
-
-// Rightward chevron overlay for row headers ("read across this row").
-fn push_right_chevron(verts: &mut Vec<UiVertex>, rect: &UiRect, color: [f32; 4], half_w: f32, half_h: f32) {
-    let cy = (rect.y0 + rect.y1) * 0.5;
-    push_triangle(
-        verts,
-        (rect.x1 - 3.0, cy),
-        (rect.x0 + 3.0, cy + 5.0),
-        (rect.x0 + 3.0, cy - 5.0),
-        color,
-        half_w,
-        half_h,
-    );
-}
-
-fn push_rect(verts: &mut Vec<UiVertex>, rect: &UiRect, color: [f32; 4], half_w: f32, half_h: f32) {
-    let c = |x: f32, y: f32| [x / half_w, y / half_h];
-    let p00 = c(rect.x0, rect.y0);
-    let p10 = c(rect.x1, rect.y0);
-    let p11 = c(rect.x1, rect.y1);
-    let p01 = c(rect.x0, rect.y1);
-    verts.push(UiVertex { clip_pos: p00, color });
-    verts.push(UiVertex { clip_pos: p10, color });
-    verts.push(UiVertex { clip_pos: p11, color });
-    verts.push(UiVertex { clip_pos: p00, color });
-    verts.push(UiVertex { clip_pos: p11, color });
-    verts.push(UiVertex { clip_pos: p01, color });
-}
-
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
-    let c = v * s;
-    let hp = h * 6.0;
-    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
-    let rgb = if hp < 1.0 {
-        [c, x, 0.0]
-    } else if hp < 2.0 {
-        [x, c, 0.0]
-    } else if hp < 3.0 {
-        [0.0, c, x]
-    } else if hp < 4.0 {
-        [0.0, x, c]
-    } else if hp < 5.0 {
-        [x, 0.0, c]
-    } else {
-        [c, 0.0, x]
-    };
-    let m = v - c;
-    [rgb[0] + m, rgb[1] + m, rgb[2] + m]
-}
-
-// Golden-angle hue spread, matching type_color() in vs.wgsl, so the grid's
-// header swatches match the particle colors on screen. Desaturated toward
-// gray so the headers read as a legend rather than competing for attention.
-fn type_color_rgb(t: u32) -> [f32; 4] {
-    let hue = (t as f32 * 0.6180339887).fract();
-    let [r, g, b] = hsv_to_rgb(hue, 0.85, 1.0);
-    let sat = 0.55;
-    let gray = 0.55;
-    [
-        gray + (r - gray) * sat,
-        gray + (g - gray) * sat,
-        gray + (b - gray) * sat,
-        1.0,
-    ]
-}
-
-// Muted diverging scale for matrix cells: dark neutral gray at 0, soft rust
-// toward repel, soft teal toward attract.
-fn matrix_value_color(v: f32) -> [f32; 4] {
-    const NEUTRAL: [f32; 3] = [0.24, 0.24, 0.27];
-    const POS: [f32; 3] = [0.25, 0.55, 0.48];
-    const NEG: [f32; 3] = [0.55, 0.30, 0.28];
-    let t = v.clamp(-1.0, 1.0);
-    let target = if t >= 0.0 { POS } else { NEG };
-    let a = t.abs();
-    [
-        NEUTRAL[0] + (target[0] - NEUTRAL[0]) * a,
-        NEUTRAL[1] + (target[1] - NEUTRAL[1]) * a,
-        NEUTRAL[2] + (target[2] - NEUTRAL[2]) * a,
-        1.0,
-    ]
-}
-
 #[derive(Clone)]
 struct Model {
     clear_counts_pipeline: Arc<wgpu::ComputePipeline>,
@@ -350,204 +144,6 @@ fn random_matrix(rng: &mut impl Rng, num_types: u32) -> Vec<f32> {
     (0..num_types * num_types)
         .map(|_| rng.gen_range(-1.0f32..1.0))
         .collect()
-}
-
-// All presets below are built around asymmetric attraction — a type chases
-// another type which only weakly (or doesn't) chase back. That asymmetry is
-// what makes a bonded group self-propel and drift across the screen instead
-// of settling into a static cluster, so every preset here produces gliders
-// of one flavor or another.
-const PRESET_COUNT: usize = 8;
-
-fn pair_partner(a: u32) -> u32 {
-    if a % 2 == 0 { a + 1 } else { a - 1 }
-}
-
-// Three independent pairs (0-1, 2-3, 4-5), strong chase / strong flee: small,
-// fast-moving gliders.
-fn preset_fast_pairs(n: u32) -> Vec<f32> {
-    (0..n * n)
-        .map(|idx| {
-            let a = idx / n;
-            let b = idx % n;
-            let partner = pair_partner(a);
-            if a == b || partner >= n || b != partner {
-                0.0
-            } else if a % 2 == 0 {
-                0.95
-            } else {
-                -0.5
-            }
-        })
-        .collect()
-}
-
-// Same pairing as Fast Pairs, but gentler asymmetry: slower, more graceful
-// drifting gliders.
-fn preset_slow_pairs(n: u32) -> Vec<f32> {
-    (0..n * n)
-        .map(|idx| {
-            let a = idx / n;
-            let b = idx % n;
-            let partner = pair_partner(a);
-            if a == b || partner >= n || b != partner {
-                0.0
-            } else if a % 2 == 0 {
-                0.5
-            } else {
-                -0.15
-            }
-        })
-        .collect()
-}
-
-// Pairs with added self-attraction, so each glider stays a tight, solid blob
-// while it drifts rather than a loose diffuse pair.
-fn preset_cohesive_gliders(n: u32) -> Vec<f32> {
-    (0..n * n)
-        .map(|idx| {
-            let a = idx / n;
-            let b = idx % n;
-            if a == b {
-                return 0.35;
-            }
-            let partner = pair_partner(a);
-            if partner >= n || b != partner {
-                return 0.0;
-            }
-            if a % 2 == 0 { 0.85 } else { -0.4 }
-        })
-        .collect()
-}
-
-// Pairs with strong self-cohesion AND strong asymmetry: compact, dense,
-// fast-darting gliders rather than loose clouds.
-fn preset_tight_darts(n: u32) -> Vec<f32> {
-    (0..n * n)
-        .map(|idx| {
-            let a = idx / n;
-            let b = idx % n;
-            if a == b {
-                return 0.6;
-            }
-            let partner = pair_partner(a);
-            if partner >= n || b != partner {
-                return 0.0;
-            }
-            if a % 2 == 0 { 0.9 } else { -0.6 }
-        })
-        .collect()
-}
-
-// Independent groups of 3 (0-1-2, 3-4-5, ...), each cycling A chases B chases
-// C chases A: the asymmetric triangle doesn't cancel out, so each trio spins
-// and drifts together as a small orbiting glider cluster.
-fn preset_triad_chasers(n: u32) -> Vec<f32> {
-    (0..n * n)
-        .map(|idx| {
-            let a = idx / n;
-            let b = idx % n;
-            if a == b {
-                return 0.0;
-            }
-            let group = (a / 3) * 3;
-            let pos = a % 3;
-            let next = group + (pos + 1) % 3;
-            let prev = group + (pos + 2) % 3;
-            if b == next {
-                0.85
-            } else if b == prev {
-                -0.3
-            } else {
-                0.0
-            }
-        })
-        .collect()
-}
-
-// One open (non-wrapping) chain across all types. Strong self-cohesion (0.6)
-// means each type clumps into a thick, solid segment instead of thin
-// scattered points; segments pull the next one forward and push off the
-// previous one to walk in a line; and a mild repulsion between every other
-// pairing keeps non-adjacent segments from merging into a formless blob, so
-// the whole thing reads as one large, distinctly segmented worm.
-fn preset_worm_train(n: u32) -> Vec<f32> {
-    (0..n * n)
-        .map(|idx| {
-            let a = (idx / n) as i32;
-            let b = (idx % n) as i32;
-            if a == b {
-                0.6
-            } else if b == a + 1 {
-                0.75
-            } else if a == b + 1 {
-                -0.35
-            } else {
-                -0.15
-            }
-        })
-        .collect()
-}
-
-// Same thick-segment recipe as Worm Train, but split into two independent
-// open 3-chains (0-1-2 and 3-4-5): two large worms instead of one.
-fn preset_twin_worms(n: u32) -> Vec<f32> {
-    (0..n * n)
-        .map(|idx| {
-            let a = idx / n;
-            let b = idx % n;
-            if a == b {
-                return 0.6;
-            }
-            let group = a / 3;
-            let pos = a % 3;
-            let same_group = b / 3 == group;
-            if same_group && pos < 2 && b == a + 1 {
-                0.75
-            } else if same_group && pos > 0 && a == b + 1 {
-                -0.35
-            } else {
-                -0.15
-            }
-        })
-        .collect()
-}
-
-// Three pairs at three different speeds (fast, medium, slow), plus a weak
-// universal attraction so the three gliders loosely stay near each other: a
-// small swarm of differently-paced movers instead of one uniform speed.
-fn preset_swarm_chase(n: u32) -> Vec<f32> {
-    (0..n * n)
-        .map(|idx| {
-            let a = idx / n;
-            let b = idx % n;
-            if a == b {
-                return 0.0;
-            }
-            let partner = pair_partner(a);
-            if partner < n && b == partner {
-                let speed = a / 2; // 0, 1, 2 for the three pairs
-                let chase = [0.95, 0.65, 0.35][speed as usize % 3];
-                let flee = [-0.6, -0.3, -0.1][speed as usize % 3];
-                if a % 2 == 0 { chase } else { flee }
-            } else {
-                0.08
-            }
-        })
-        .collect()
-}
-
-fn preset_matrix(index: usize, num_types: u32) -> Vec<f32> {
-    match index % PRESET_COUNT {
-        0 => preset_fast_pairs(num_types),
-        1 => preset_slow_pairs(num_types),
-        2 => preset_cohesive_gliders(num_types),
-        3 => preset_tight_darts(num_types),
-        4 => preset_triad_chasers(num_types),
-        5 => preset_worm_train(num_types),
-        6 => preset_twin_worms(num_types),
-        _ => preset_swarm_chase(num_types),
-    }
 }
 
 // The particle buffers, spatial-grid scratch buffers, and the bind groups
@@ -807,7 +403,7 @@ fn model(app: &App) -> Model {
 
     let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("ui-vertices"),
-        size: (UI_MAX_VERTICES * std::mem::size_of::<UiVertex>()) as u64,
+        size: (ui::UI_MAX_VERTICES * std::mem::size_of::<UiVertex>()) as u64,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -863,13 +459,12 @@ fn model(app: &App) -> Model {
     }
 }
 
-fn update(app: &App, model: &mut Model) {
-    let window = app.main_window();
-
-    if app.keys().just_pressed(KeyCode::KeyP) {
-        model.paused = !model.paused;
-    }
-
+// Toggles fullscreen on F, and once the OS actually resizes the window
+// (which takes a frame or more after the mode change), updates the screen
+// viewport extents. World size is fixed, so this never touches particle or
+// grid buffers - only the screen_half_w/h that the camera transform reads.
+// Returns whether Params changed (and needs re-uploading).
+fn handle_fullscreen_and_resize(app: &App, model: &mut Model) -> bool {
     if app.keys().just_pressed(KeyCode::KeyF) {
         model.fullscreen = !model.fullscreen;
         let going_fullscreen = model.fullscreen;
@@ -886,16 +481,12 @@ fn update(app: &App, model: &mut Model) {
                     };
                 });
         });
-        // The mode change takes a frame or more to actually resize the
-        // window; poll each frame below until the observed size changes.
         model.pending_resize = true;
     }
 
-    // World size is fixed regardless of window size, so a resize only ever
-    // changes the screen viewport (and therefore the UI layout / camera
-    // fit) - no particle or spatial-grid buffers need rebuilding.
     let mut params_changed = false;
     if model.pending_resize {
+        let window = app.main_window();
         let rect = window.rect();
         let new_screen_half_w = rect.w() * 0.5;
         let new_screen_half_h = rect.h() * 0.5;
@@ -908,9 +499,19 @@ fn update(app: &App, model: &mut Model) {
             model.pending_resize = false;
         }
     }
+    params_changed
+}
 
-    // --- keyboard camera controls: zoom (+/-) and pan (arrow keys) ---
+// Keyboard camera controls: zoom (=/-, continuous while held) and pan (arrow
+// keys). Pan speed scales with 1/zoom so it feels like a constant on-screen
+// speed rather than a constant world-space speed (otherwise panning feels
+// sluggish when zoomed in and way too fast when zoomed out). Panning past a
+// world edge wraps around, matching how particles themselves wrap.
+// Returns whether Params changed (and needs re-uploading).
+fn handle_camera_input(app: &App, model: &mut Model) -> bool {
+    let mut params_changed = false;
     let dt = app.time_delta();
+
     if app.keys().pressed(KeyCode::Equal) || app.keys().pressed(KeyCode::NumpadAdd) {
         model.params.zoom = (model.params.zoom * (1.0 + ZOOM_RATE * dt)).clamp(ZOOM_MIN, ZOOM_MAX);
         params_changed = true;
@@ -919,9 +520,7 @@ fn update(app: &App, model: &mut Model) {
         model.params.zoom = (model.params.zoom / (1.0 + ZOOM_RATE * dt)).clamp(ZOOM_MIN, ZOOM_MAX);
         params_changed = true;
     }
-    // Pan speed scales with 1/zoom so it feels like a constant on-screen
-    // speed rather than a constant world-space speed (otherwise panning
-    // feels sluggish when zoomed in and way too fast when zoomed out).
+
     let pan_step = PAN_SPEED * dt / model.params.zoom;
     let mut pan = Vec2::ZERO;
     if app.keys().pressed(KeyCode::ArrowLeft) {
@@ -939,24 +538,22 @@ fn update(app: &App, model: &mut Model) {
     if pan != Vec2::ZERO {
         let world_w = model.params.half_width * 2.0;
         let world_h = model.params.half_height * 2.0;
-        // Wrap the camera the same way particles wrap, so panning past an
-        // edge loops back around rather than drifting off into empty space.
         let wrap = |v: f32, half: f32, full: f32| ((v + half).rem_euclid(full)) - half;
         model.params.camera_x = wrap(model.params.camera_x + pan.x, model.params.half_width, world_w);
         model.params.camera_y = wrap(model.params.camera_y + pan.y, model.params.half_height, world_h);
         params_changed = true;
     }
 
-    let randomize_matrix_key = app.keys().just_pressed(KeyCode::KeyR);
-    let cycle_preset = app.keys().just_pressed(KeyCode::Space);
-    let mut matrix_changed = false;
+    params_changed
+}
 
-    // --- mouse interaction with the on-screen panel (screen-locked; the
-    // panel never moves or scales with the world camera) ---
-    let half_w = model.params.screen_half_w;
-    let half_h = model.params.screen_half_h;
-    let num_types = model.params.num_types;
-    let layout = compute_ui_layout(half_w, half_h, num_types);
+// Mouse interaction with the on-screen panel (screen-locked; the panel never
+// moves or scales with the world camera): press-to-start-drag, drag-to-set
+// for both the speed slider and matrix cells, release-to-stop. Returns
+// (params_changed, matrix_changed).
+fn handle_ui_mouse(app: &App, model: &mut Model, layout: &UiLayout, num_types: u32) -> (bool, bool) {
+    let mut params_changed = false;
+    let mut matrix_changed = false;
 
     let mouse = app.mouse();
     let mouse_pressed = app.mouse_buttons().just_pressed(MouseButton::Left);
@@ -969,7 +566,7 @@ fn update(app: &App, model: &mut Model) {
         } else {
             for row in 0..num_types {
                 for col in 0..num_types {
-                    let rect = grid_cell_rect(layout.grid_origin, row + 1, col + 1);
+                    let rect = ui::grid_cell_rect(layout.grid_origin, row + 1, col + 1);
                     if rect.contains(mouse) {
                         let idx = (row * num_types + col) as usize;
                         model.dragging_cell = Some(idx);
@@ -1010,85 +607,72 @@ fn update(app: &App, model: &mut Model) {
         model.dragging_cell = None;
     }
 
-    if params_changed {
-        model.params.force_scale = BASE_FORCE_SCALE * model.speed_mult;
-        window
-            .queue()
-            .write_buffer(&model.params_buffer, 0, bytemuck::bytes_of(&model.params));
-    }
+    (params_changed, matrix_changed)
+}
 
-    let mut rng = rand::thread_rng();
-    if randomize_matrix_key {
-        model.matrix = random_matrix(&mut rng, model.params.num_types);
-        matrix_changed = true;
-    }
-    if cycle_preset {
-        model.preset_index = (model.preset_index + 1) % PRESET_COUNT;
-        model.matrix = preset_matrix(model.preset_index, model.params.num_types);
-        matrix_changed = true;
-    }
-    if matrix_changed {
-        window
-            .queue()
-            .write_buffer(&model.matrix_buffer, 0, bytemuck::cast_slice(&model.matrix));
-    }
-    // --- rebuild the UI overlay geometry every frame (even while paused) ---
-    let mut ui_vertices: Vec<UiVertex> = Vec::with_capacity(UI_MAX_VERTICES);
+// Rebuilds the UI overlay geometry and uploads it - runs every frame, even
+// while paused, so the panel stays live and interactive at all times.
+fn build_and_upload_ui(
+    model: &mut Model,
+    queue: &wgpu::Queue,
+    layout: &UiLayout,
+    half_w: f32,
+    half_h: f32,
+    num_types: u32,
+) {
+    let mut ui_vertices: Vec<UiVertex> = Vec::with_capacity(ui::UI_MAX_VERTICES);
 
-    push_rect(&mut ui_vertices, &layout.panel_bg, [0.0, 0.0, 0.0, 0.55], half_w, half_h);
-    push_rect(&mut ui_vertices, &layout.slider_track, [1.0, 1.0, 1.0, 0.25], half_w, half_h);
+    ui::push_rect(&mut ui_vertices, &layout.panel_bg, [0.0, 0.0, 0.0, 0.55], half_w, half_h);
+    ui::push_rect(&mut ui_vertices, &layout.slider_track, [1.0, 1.0, 1.0, 0.25], half_w, half_h);
 
     let log_min = SPEED_MULT_MIN.ln();
     let log_max = SPEED_MULT_MAX.ln();
     let t = ((model.speed_mult.ln() - log_min) / (log_max - log_min)).clamp(0.0, 1.0);
     let handle_x = layout.slider_x0 + t * (layout.slider_x1 - layout.slider_x0);
     let handle_half = 6.0;
-    let handle_rect = UiRect {
+    let handle_rect = ui::UiRect {
         x0: handle_x - handle_half,
         x1: handle_x + handle_half,
         y0: layout.slider_y_center - handle_half - 3.0,
         y1: layout.slider_y_center + handle_half + 3.0,
     };
-    push_rect(&mut ui_vertices, &handle_rect, [1.0, 1.0, 1.0, 0.9], half_w, half_h);
+    ui::push_rect(&mut ui_vertices, &handle_rect, [1.0, 1.0, 1.0, 0.9], half_w, half_h);
 
     // Column headers get a downward chevron ("read down this column"); row
     // headers get a rightward chevron ("read across this row") — a text-free
     // way to show which axis is "from" and which is "to" in the matrix.
     const CHEVRON_COLOR: [f32; 4] = [0.05, 0.05, 0.05, 0.85];
     for i in 0..num_types {
-        let rect_col = grid_cell_rect(layout.grid_origin, 0, i + 1);
-        push_rect(&mut ui_vertices, &rect_col, type_color_rgb(i), half_w, half_h);
-        push_down_chevron(&mut ui_vertices, &rect_col, CHEVRON_COLOR, half_w, half_h);
+        let rect_col = ui::grid_cell_rect(layout.grid_origin, 0, i + 1);
+        ui::push_rect(&mut ui_vertices, &rect_col, ui::type_color_rgb(i), half_w, half_h);
+        ui::push_down_chevron(&mut ui_vertices, &rect_col, CHEVRON_COLOR, half_w, half_h);
 
-        let rect_row = grid_cell_rect(layout.grid_origin, i + 1, 0);
-        push_rect(&mut ui_vertices, &rect_row, type_color_rgb(i), half_w, half_h);
-        push_right_chevron(&mut ui_vertices, &rect_row, CHEVRON_COLOR, half_w, half_h);
+        let rect_row = ui::grid_cell_rect(layout.grid_origin, i + 1, 0);
+        ui::push_rect(&mut ui_vertices, &rect_row, ui::type_color_rgb(i), half_w, half_h);
+        ui::push_right_chevron(&mut ui_vertices, &rect_row, CHEVRON_COLOR, half_w, half_h);
     }
     for row in 0..num_types {
         for col in 0..num_types {
             let idx = (row * num_types + col) as usize;
-            let rect = grid_cell_rect(layout.grid_origin, row + 1, col + 1);
-            let mut color = matrix_value_color(model.matrix[idx]);
+            let rect = ui::grid_cell_rect(layout.grid_origin, row + 1, col + 1);
+            let mut color = ui::matrix_value_color(model.matrix[idx]);
             if model.dragging_cell == Some(idx) {
                 // Brighten the cell currently being dragged for clear feedback.
                 for c in color.iter_mut().take(3) {
                     *c = (*c + 0.35).min(1.0);
                 }
             }
-            push_rect(&mut ui_vertices, &rect, color, half_w, half_h);
+            ui::push_rect(&mut ui_vertices, &rect, color, half_w, half_h);
         }
     }
 
     model.ui_vertex_count = ui_vertices.len() as u32;
-    window
-        .queue()
-        .write_buffer(&model.ui_vertex_buffer, 0, bytemuck::cast_slice(&ui_vertices));
+    queue.write_buffer(&model.ui_vertex_buffer, 0, bytemuck::cast_slice(&ui_vertices));
+}
 
-    if model.paused {
-        return;
-    }
-
-    let device = window.device();
+// The 6-pass GPU dispatch: clear -> count -> prefix-sum -> clear -> scatter
+// -> force (see grid_compute.wgsl for what each pass does).
+fn dispatch_compute(model: &mut Model, device: &wgpu::Device, queue: &wgpu::Queue) {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("particle-life-compute"),
     });
@@ -1122,8 +706,59 @@ fn update(app: &App, model: &mut Model) {
     // 6. Force pass: each particle only checks its 3x3 neighboring cells.
     dispatch(&mut encoder, "compute-forces", &model.force_pipeline, particle_workgroups);
 
-    window.queue().submit(Some(encoder.finish()));
+    queue.submit(Some(encoder.finish()));
     model.current = 1 - model.current;
+}
+
+fn update(app: &App, model: &mut Model) {
+    if app.keys().just_pressed(KeyCode::KeyP) {
+        model.paused = !model.paused;
+    }
+
+    let mut params_changed = handle_fullscreen_and_resize(app, model);
+    params_changed |= handle_camera_input(app, model);
+
+    let randomize_matrix_key = app.keys().just_pressed(KeyCode::KeyR);
+    let cycle_preset = app.keys().just_pressed(KeyCode::Space);
+
+    let half_w = model.params.screen_half_w;
+    let half_h = model.params.screen_half_h;
+    let num_types = model.params.num_types;
+    let layout = ui::compute_ui_layout(half_w, half_h, num_types);
+
+    let (ui_params_changed, mut matrix_changed) = handle_ui_mouse(app, model, &layout, num_types);
+    params_changed |= ui_params_changed;
+
+    let window = app.main_window();
+    let device = window.device();
+    let queue = window.queue();
+
+    if params_changed {
+        model.params.force_scale = BASE_FORCE_SCALE * model.speed_mult;
+        queue.write_buffer(&model.params_buffer, 0, bytemuck::bytes_of(&model.params));
+    }
+
+    let mut rng = rand::thread_rng();
+    if randomize_matrix_key {
+        model.matrix = random_matrix(&mut rng, model.params.num_types);
+        matrix_changed = true;
+    }
+    if cycle_preset {
+        model.preset_index = (model.preset_index + 1) % presets::PRESET_COUNT;
+        model.matrix = presets::preset_matrix(model.preset_index, model.params.num_types);
+        matrix_changed = true;
+    }
+    if matrix_changed {
+        queue.write_buffer(&model.matrix_buffer, 0, bytemuck::cast_slice(&model.matrix));
+    }
+
+    build_and_upload_ui(model, queue, &layout, half_w, half_h, num_types);
+
+    if model.paused {
+        return;
+    }
+
+    dispatch_compute(model, device, queue);
 }
 
 fn render(_app: &RenderApp, model: &Model, frame: Frame) {
