@@ -246,6 +246,143 @@ fn build_particle_resources(
     }
 }
 
+// Spatial-grid compute pipeline: 5 passes (clear, count, prefix sum,
+// scatter, force) sharing one bind group layout and one shader module.
+struct ComputePipelines {
+    bind_group_layout: wgpu::BindGroupLayout,
+    clear_counts: wgpu::ComputePipeline,
+    count: wgpu::ComputePipeline,
+    prefix_sum: wgpu::ComputePipeline,
+    scatter: wgpu::ComputePipeline,
+    force: wgpu::ComputePipeline,
+}
+
+fn build_compute_pipelines(device: &wgpu::Device) -> ComputePipelines {
+    let cs_desc = wgpu::include_wgsl!("shaders/grid_compute.wgsl");
+    let cs_mod = device.create_shader_module(cs_desc);
+
+    let bind_group_layout = wgpu::BindGroupLayoutBuilder::new()
+        .uniform_buffer(wgpu::ShaderStages::COMPUTE, false) // 0: params
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, true) // 1: matrix (read-only)
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, true) // 2: particles_in (read-only)
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // 3: particles_out (read-write)
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // 4: cell_counts (read-write)
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // 5: cell_offsets (read-write)
+        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // 6: sorted_indices (read-write)
+        .build(device);
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("particle-life-compute-layout"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+
+    let make_pipeline = |label: &str, entry_point: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pipeline_layout),
+            module: &cs_mod,
+            entry_point: Some(entry_point),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+
+    ComputePipelines {
+        clear_counts: make_pipeline("particle-life-clear-counts", "clear_counts"),
+        count: make_pipeline("particle-life-count", "count_particles"),
+        prefix_sum: make_pipeline("particle-life-prefix-sum", "prefix_sum"),
+        scatter: make_pipeline("particle-life-scatter", "scatter_particles"),
+        force: make_pipeline("particle-life-force", "compute_forces"),
+        bind_group_layout,
+    }
+}
+
+// Particle render pipeline: instanced quads reading straight from the GPU
+// particle buffer the compute shader writes.
+struct ParticleRenderPipeline {
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    quad_vertex_buffer: wgpu::Buffer,
+}
+
+fn build_particle_render_pipeline(device: &wgpu::Device, sample_count: u32) -> ParticleRenderPipeline {
+    let vs_desc = wgpu::include_wgsl!("shaders/vs.wgsl");
+    let fs_desc = wgpu::include_wgsl!("shaders/fs.wgsl");
+    let vs_mod = device.create_shader_module(vs_desc);
+    let fs_mod = device.create_shader_module(fs_desc);
+
+    let bind_group_layout = wgpu::BindGroupLayoutBuilder::new()
+        .storage_buffer(wgpu::ShaderStages::VERTEX, false, true) // particles (read-only)
+        .uniform_buffer(wgpu::ShaderStages::VERTEX, false)
+        .build(device);
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("particle-life-render-layout"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+
+    let pipeline = wgpu::RenderPipelineBuilder::from_layout(&pipeline_layout, &vs_mod)
+        .fragment_shader(&fs_mod)
+        .color_format(Frame::TEXTURE_FORMAT)
+        .add_vertex_buffer::<QuadVertex>(&wgpu::vertex_attr_array![0 => Float32x2])
+        .sample_count(sample_count)
+        .build(device);
+
+    let quad_vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("quad-vertices"),
+        contents: bytemuck::cast_slice(&QUAD_VERTICES),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    ParticleRenderPipeline {
+        bind_group_layout,
+        pipeline,
+        quad_vertex_buffer,
+    }
+}
+
+// On-screen UI overlay pipeline: plain colored triangles, no bind groups -
+// geometry is precomputed to clip-space on the CPU each frame. Entirely
+// independent of the particle pipeline above (own shaders, own buffer, no
+// shared bind group layout).
+struct UiPipelineResources {
+    pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+}
+
+fn build_ui_pipeline(device: &wgpu::Device, sample_count: u32) -> UiPipelineResources {
+    let vs_desc = wgpu::include_wgsl!("shaders/ui_vs.wgsl");
+    let fs_desc = wgpu::include_wgsl!("shaders/ui_fs.wgsl");
+    let vs_mod = device.create_shader_module(vs_desc);
+    let fs_mod = device.create_shader_module(fs_desc);
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("particle-life-ui-layout"),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
+
+    const UI_VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
+    let pipeline = wgpu::RenderPipelineBuilder::from_layout(&pipeline_layout, &vs_mod)
+        .fragment_shader(&fs_mod)
+        .color_format(Frame::TEXTURE_FORMAT)
+        .add_vertex_buffer::<UiVertex>(&UI_VERTEX_ATTRS)
+        .sample_count(sample_count)
+        .build(device);
+
+    let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ui-vertices"),
+        size: (ui::UI_MAX_VERTICES * std::mem::size_of::<UiVertex>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    UiPipelineResources { pipeline, vertex_buffer }
+}
+
 fn model(app: &App) -> Model {
     let w_id = app
         .new_window::<Model>()
@@ -313,105 +450,15 @@ fn model(app: &App) -> Model {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
-    // --- spatial-grid compute pipeline (5 passes: clear, count, prefix sum,
-    // scatter, force) sharing one bind group layout and one shader module ---
-    let cs_desc = wgpu::include_wgsl!("shaders/grid_compute.wgsl");
-    let cs_mod = device.create_shader_module(cs_desc);
-
-    let compute_bgl = wgpu::BindGroupLayoutBuilder::new()
-        .uniform_buffer(wgpu::ShaderStages::COMPUTE, false) // 0: params
-        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, true) // 1: matrix (read-only)
-        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, true) // 2: particles_in (read-only)
-        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // 3: particles_out (read-write)
-        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // 4: cell_counts (read-write)
-        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // 5: cell_offsets (read-write)
-        .storage_buffer(wgpu::ShaderStages::COMPUTE, false, false) // 6: sorted_indices (read-write)
-        .build(&device);
-
-    let compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("particle-life-compute-layout"),
-        bind_group_layouts: &[Some(&compute_bgl)],
-        immediate_size: 0,
-    });
-
-    let make_compute_pipeline = |label: &str, entry_point: &str| {
-        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(label),
-            layout: Some(&compute_pipeline_layout),
-            module: &cs_mod,
-            entry_point: Some(entry_point),
-            compilation_options: Default::default(),
-            cache: None,
-        })
-    };
-    let clear_counts_pipeline = make_compute_pipeline("particle-life-clear-counts", "clear_counts");
-    let count_pipeline = make_compute_pipeline("particle-life-count", "count_particles");
-    let prefix_sum_pipeline = make_compute_pipeline("particle-life-prefix-sum", "prefix_sum");
-    let scatter_pipeline = make_compute_pipeline("particle-life-scatter", "scatter_particles");
-    let force_pipeline = make_compute_pipeline("particle-life-force", "compute_forces");
-
-    // --- particle render pipeline ---
-    let vs_desc = wgpu::include_wgsl!("shaders/vs.wgsl");
-    let fs_desc = wgpu::include_wgsl!("shaders/fs.wgsl");
-    let vs_mod = device.create_shader_module(vs_desc);
-    let fs_mod = device.create_shader_module(fs_desc);
-
-    let render_bgl = wgpu::BindGroupLayoutBuilder::new()
-        .storage_buffer(wgpu::ShaderStages::VERTEX, false, true) // particles (read-only)
-        .uniform_buffer(wgpu::ShaderStages::VERTEX, false)
-        .build(&device);
-
-    let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("particle-life-render-layout"),
-        bind_group_layouts: &[Some(&render_bgl)],
-        immediate_size: 0,
-    });
-
-    let render_pipeline = wgpu::RenderPipelineBuilder::from_layout(&render_pipeline_layout, &vs_mod)
-        .fragment_shader(&fs_mod)
-        .color_format(Frame::TEXTURE_FORMAT)
-        .add_vertex_buffer::<QuadVertex>(&wgpu::vertex_attr_array![0 => Float32x2])
-        .sample_count(window.msaa_samples())
-        .build(&device);
-
-    let quad_vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("quad-vertices"),
-        contents: bytemuck::cast_slice(&QUAD_VERTICES),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-
-    // --- on-screen UI overlay pipeline (plain colored triangles, no bind groups) ---
-    let ui_vs_desc = wgpu::include_wgsl!("shaders/ui_vs.wgsl");
-    let ui_fs_desc = wgpu::include_wgsl!("shaders/ui_fs.wgsl");
-    let ui_vs_mod = device.create_shader_module(ui_vs_desc);
-    let ui_fs_mod = device.create_shader_module(ui_fs_desc);
-
-    let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("particle-life-ui-layout"),
-        bind_group_layouts: &[],
-        immediate_size: 0,
-    });
-
-    const UI_VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
-    let ui_pipeline = wgpu::RenderPipelineBuilder::from_layout(&ui_pipeline_layout, &ui_vs_mod)
-        .fragment_shader(&ui_fs_mod)
-        .color_format(Frame::TEXTURE_FORMAT)
-        .add_vertex_buffer::<UiVertex>(&UI_VERTEX_ATTRS)
-        .sample_count(window.msaa_samples())
-        .build(&device);
-
-    let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ui-vertices"),
-        size: (ui::UI_MAX_VERTICES * std::mem::size_of::<UiVertex>()) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let sample_count = window.msaa_samples();
+    let compute = build_compute_pipelines(&device);
+    let particle_render = build_particle_render_pipeline(&device, sample_count);
+    let ui_render = build_ui_pipeline(&device, sample_count);
 
     let particle_res = build_particle_resources(
         &device,
-        &compute_bgl,
-        &render_bgl,
+        &compute.bind_group_layout,
+        &particle_render.bind_group_layout,
         &params_buffer,
         &matrix_buffer,
         matrix_buf_size,
@@ -423,26 +470,26 @@ fn model(app: &App) -> Model {
     );
 
     Model {
-        clear_counts_pipeline: Arc::new(clear_counts_pipeline),
-        count_pipeline: Arc::new(count_pipeline),
-        prefix_sum_pipeline: Arc::new(prefix_sum_pipeline),
-        scatter_pipeline: Arc::new(scatter_pipeline),
-        force_pipeline: Arc::new(force_pipeline),
+        clear_counts_pipeline: Arc::new(compute.clear_counts),
+        count_pipeline: Arc::new(compute.count),
+        prefix_sum_pipeline: Arc::new(compute.prefix_sum),
+        scatter_pipeline: Arc::new(compute.scatter),
+        force_pipeline: Arc::new(compute.force),
         num_cells,
         compute_bind_groups: [
             Arc::new(particle_res.compute_bind_group_0),
             Arc::new(particle_res.compute_bind_group_1),
         ],
-        render_pipeline: Arc::new(render_pipeline),
+        render_pipeline: Arc::new(particle_render.pipeline),
         render_bind_groups: [
             Arc::new(particle_res.render_bind_group_0),
             Arc::new(particle_res.render_bind_group_1),
         ],
-        quad_vertex_buffer: Arc::new(quad_vertex_buffer),
+        quad_vertex_buffer: Arc::new(particle_render.quad_vertex_buffer),
         matrix_buffer: Arc::new(matrix_buffer),
         params_buffer: Arc::new(params_buffer),
-        ui_pipeline: Arc::new(ui_pipeline),
-        ui_vertex_buffer: Arc::new(ui_vertex_buffer),
+        ui_pipeline: Arc::new(ui_render.pipeline),
+        ui_vertex_buffer: Arc::new(ui_render.vertex_buffer),
         ui_vertex_count: 0,
         current: 0,
         paused: false,
@@ -761,6 +808,24 @@ fn update(app: &App, model: &mut Model) {
     dispatch_compute(model, device, queue);
 }
 
+fn render_particles(render_pass: &mut wgpu::RenderPass, model: &Model) {
+    render_pass.set_bind_group(0, &*model.render_bind_groups[model.current], &[]);
+    render_pass.set_pipeline(&model.render_pipeline);
+    render_pass.set_vertex_buffer(0, model.quad_vertex_buffer.slice(..));
+    let vertex_range = 0..QUAD_VERTICES.len() as u32;
+    let instance_range = 0..model.params.num_particles;
+    render_pass.draw(vertex_range, instance_range);
+}
+
+fn render_ui(render_pass: &mut wgpu::RenderPass, model: &Model) {
+    if model.ui_vertex_count == 0 {
+        return;
+    }
+    render_pass.set_pipeline(&model.ui_pipeline);
+    render_pass.set_vertex_buffer(0, model.ui_vertex_buffer.slice(..));
+    render_pass.draw(0..model.ui_vertex_count, 0..1);
+}
+
 fn render(_app: &RenderApp, model: &Model, frame: Frame) {
     let mut encoder = frame.command_encoder();
     let mut render_pass = wgpu::RenderPassBuilder::new()
@@ -772,16 +837,8 @@ fn render(_app: &RenderApp, model: &Model, frame: Frame) {
         })))
         .begin(&mut encoder);
 
-    render_pass.set_bind_group(0, &*model.render_bind_groups[model.current], &[]);
-    render_pass.set_pipeline(&model.render_pipeline);
-    render_pass.set_vertex_buffer(0, model.quad_vertex_buffer.slice(..));
-    let vertex_range = 0..QUAD_VERTICES.len() as u32;
-    let instance_range = 0..model.params.num_particles;
-    render_pass.draw(vertex_range, instance_range);
-
-    if model.ui_vertex_count > 0 {
-        render_pass.set_pipeline(&model.ui_pipeline);
-        render_pass.set_vertex_buffer(0, model.ui_vertex_buffer.slice(..));
-        render_pass.draw(0..model.ui_vertex_count, 0..1);
-    }
+    // Particles first, UI second - the UI overlay composites on top via
+    // alpha blending since it's drawn later in the same pass.
+    render_particles(&mut render_pass, model);
+    render_ui(&mut render_pass, model);
 }
