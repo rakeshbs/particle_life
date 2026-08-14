@@ -5,9 +5,23 @@ use std::sync::Arc;
 
 const WINDOW_W: u32 = 1280;
 const WINDOW_H: u32 = 720;
-const NUM_PARTICLES: u32 = 12_000;
+// Simulation world is larger than the screen (same 16:9 ratio, ~10x the
+// area) so there's a "canvas" to pan and zoom around in. World size is
+// fixed regardless of window size / fullscreen - only the viewport into it
+// changes size, so particle count never needs to change on resize.
+const WORLD_W: f32 = 4096.0;
+const WORLD_H: f32 = 2304.0;
+const NUM_PARTICLES: u32 = 130_000;
 const NUM_TYPES: u32 = 6;
 const WORKGROUP_SIZE: u32 = 64;
+// Camera zoom bounds. Min fits the whole world to the initial window size;
+// max is an arbitrary "close enough to see individual particles" limit.
+const ZOOM_MIN: f32 = 0.28;
+const ZOOM_MAX: f32 = 8.0;
+// Multiplicative zoom rate per second (exponential: feels equally fast at
+// any zoom level) and pan speed in world units/sec at zoom=1.
+const ZOOM_RATE: f32 = 1.6;
+const PAN_SPEED: f32 = 900.0;
 // Spatial grid cell size for neighbor search. Must be >= max_radius so the
 // 3x3 neighborhood always covers the full interaction radius.
 const CELL_SIZE: f32 = 80.0;
@@ -45,6 +59,7 @@ struct Particle {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
+    // World half-extents (the simulation canvas: physics, wrap, spatial grid).
     half_width: f32,
     half_height: f32,
     dt: f32,
@@ -60,6 +75,14 @@ struct Params {
     grid_rows: u32,
     num_cells: u32,
     max_cell_scan: u32,
+    // Screen half-extents (the viewport in pixels) and camera: these turn
+    // world-space positions into clip space for the particle vertex shader.
+    // The UI panel is screen-locked and never reads these.
+    screen_half_w: f32,
+    screen_half_h: f32,
+    camera_x: f32,
+    camera_y: f32,
+    zoom: f32,
 }
 
 #[repr(C)]
@@ -284,8 +307,6 @@ struct Model {
     prefix_sum_pipeline: Arc<wgpu::ComputePipeline>,
     scatter_pipeline: Arc<wgpu::ComputePipeline>,
     force_pipeline: Arc<wgpu::ComputePipeline>,
-    compute_bgl: Arc<wgpu::BindGroupLayout>,
-    render_bgl: Arc<wgpu::BindGroupLayout>,
     num_cells: u32,
     compute_bind_groups: [Arc<wgpu::BindGroup>; 2],
     render_pipeline: Arc<wgpu::RenderPipeline>,
@@ -308,7 +329,6 @@ struct Model {
     preset_index: usize,
     fullscreen: bool,
     pending_resize: bool,
-    density: f32,
 }
 
 fn main() {
@@ -530,19 +550,15 @@ fn preset_matrix(index: usize, num_types: u32) -> Vec<f32> {
     }
 }
 
-// Everything that depends on particle count / window size: the particle
-// buffers, the spatial-grid scratch buffers (sized off the grid dimensions,
-// which depend on window size), and the bind groups that reference them.
-// Pulled out so it can be called both at startup and again on a fullscreen
-// resize, without re-creating the (size-independent) pipelines/shaders.
+// The particle buffers, spatial-grid scratch buffers, and the bind groups
+// that reference them - everything needed to run the simulation for a given
+// world size / particle count. World size is fixed for the app's lifetime,
+// so this only ever runs once, at startup.
 struct ParticleResources {
     compute_bind_group_0: wgpu::BindGroup,
     compute_bind_group_1: wgpu::BindGroup,
     render_bind_group_0: wgpu::BindGroup,
     render_bind_group_1: wgpu::BindGroup,
-    grid_cols: u32,
-    grid_rows: u32,
-    num_cells: u32,
 }
 
 fn build_particle_resources(
@@ -631,9 +647,6 @@ fn build_particle_resources(
         compute_bind_group_1,
         render_bind_group_0,
         render_bind_group_1,
-        grid_cols,
-        grid_rows,
-        num_cells,
     }
 }
 
@@ -650,14 +663,20 @@ fn model(app: &App) -> Model {
     let window = app.window(w_id);
     let device = window.device();
 
-    let half_w = WINDOW_W as f32 * 0.5;
-    let half_h = WINDOW_H as f32 * 0.5;
+    // World: the simulation canvas (fixed size, independent of window size).
+    let half_w = WORLD_W * 0.5;
+    let half_h = WORLD_H * 0.5;
+    // Screen: the viewport in pixels (changes on resize/fullscreen).
+    let screen_half_w = WINDOW_W as f32 * 0.5;
+    let screen_half_h = WINDOW_H as f32 * 0.5;
+    // Start zoomed out just enough to fit the whole world in the window.
+    let initial_zoom = (WINDOW_W as f32 / WORLD_W).min(WINDOW_H as f32 / WORLD_H);
 
     let mut rng = rand::thread_rng();
     let matrix = random_matrix(&mut rng, NUM_TYPES);
 
-    let grid_cols = (WINDOW_W as f32 / CELL_SIZE).ceil() as u32;
-    let grid_rows = (WINDOW_H as f32 / CELL_SIZE).ceil() as u32;
+    let grid_cols = (WORLD_W / CELL_SIZE).ceil() as u32;
+    let grid_rows = (WORLD_H / CELL_SIZE).ceil() as u32;
     let num_cells = grid_cols * grid_rows;
 
     let params = Params {
@@ -668,7 +687,7 @@ fn model(app: &App) -> Model {
         max_radius: 80.0,
         beta: 0.3,
         force_scale: BASE_FORCE_SCALE,
-        particle_radius: 2.0,
+        particle_radius: 3.0,
         num_types: NUM_TYPES,
         num_particles: NUM_PARTICLES,
         cell_size: CELL_SIZE,
@@ -676,6 +695,11 @@ fn model(app: &App) -> Model {
         grid_rows,
         num_cells,
         max_cell_scan: MAX_CELL_SCAN,
+        screen_half_w,
+        screen_half_h,
+        camera_x: 0.0,
+        camera_y: 0.0,
+        zoom: initial_zoom,
     };
 
     let matrix_buf_size =
@@ -808,8 +832,6 @@ fn model(app: &App) -> Model {
         prefix_sum_pipeline: Arc::new(prefix_sum_pipeline),
         scatter_pipeline: Arc::new(scatter_pipeline),
         force_pipeline: Arc::new(force_pipeline),
-        compute_bgl: Arc::new(compute_bgl),
-        render_bgl: Arc::new(render_bgl),
         num_cells,
         compute_bind_groups: [
             Arc::new(particle_res.compute_bind_group_0),
@@ -838,7 +860,6 @@ fn model(app: &App) -> Model {
         preset_index: 0,
         fullscreen: false,
         pending_resize: false,
-        density: NUM_PARTICLES as f32 / (WINDOW_W as f32 * WINDOW_H as f32),
     }
 }
 
@@ -866,72 +887,74 @@ fn update(app: &App, model: &mut Model) {
                 });
         });
         // The mode change takes a frame or more to actually resize the
-        // window; poll each frame below until the observed size changes,
-        // then rebuild the particle/grid buffers for the new dimensions.
+        // window; poll each frame below until the observed size changes.
         model.pending_resize = true;
     }
 
+    // World size is fixed regardless of window size, so a resize only ever
+    // changes the screen viewport (and therefore the UI layout / camera
+    // fit) - no particle or spatial-grid buffers need rebuilding.
+    let mut params_changed = false;
     if model.pending_resize {
         let rect = window.rect();
-        let new_half_w = rect.w() * 0.5;
-        let new_half_h = rect.h() * 0.5;
-        if (new_half_w - model.params.half_width).abs() > 0.5
-            || (new_half_h - model.params.half_height).abs() > 0.5
+        let new_screen_half_w = rect.w() * 0.5;
+        let new_screen_half_h = rect.h() * 0.5;
+        if (new_screen_half_w - model.params.screen_half_w).abs() > 0.5
+            || (new_screen_half_h - model.params.screen_half_h).abs() > 0.5
         {
-            let device = window.device();
-            let new_num_particles =
-                ((model.density * rect.w() * rect.h()).round() as u32).max(100);
-            let matrix_buf_size = std::num::NonZeroU64::new(
-                (model.matrix.len() * std::mem::size_of::<f32>()) as u64,
-            )
-            .unwrap();
-            let mut rng = rand::thread_rng();
-            let particle_res = build_particle_resources(
-                device,
-                &model.compute_bgl,
-                &model.render_bgl,
-                &model.params_buffer,
-                &model.matrix_buffer,
-                matrix_buf_size,
-                new_half_w,
-                new_half_h,
-                new_num_particles,
-                model.params.num_types,
-                &mut rng,
-            );
-
-            model.params.half_width = new_half_w;
-            model.params.half_height = new_half_h;
-            model.params.num_particles = new_num_particles;
-            model.params.grid_cols = particle_res.grid_cols;
-            model.params.grid_rows = particle_res.grid_rows;
-            model.params.num_cells = particle_res.num_cells;
-            model.num_cells = particle_res.num_cells;
-            window
-                .queue()
-                .write_buffer(&model.params_buffer, 0, bytemuck::bytes_of(&model.params));
-
-            model.compute_bind_groups = [
-                Arc::new(particle_res.compute_bind_group_0),
-                Arc::new(particle_res.compute_bind_group_1),
-            ];
-            model.render_bind_groups = [
-                Arc::new(particle_res.render_bind_group_0),
-                Arc::new(particle_res.render_bind_group_1),
-            ];
-            model.current = 0;
+            model.params.screen_half_w = new_screen_half_w;
+            model.params.screen_half_h = new_screen_half_h;
+            params_changed = true;
             model.pending_resize = false;
         }
+    }
+
+    // --- keyboard camera controls: zoom (+/-) and pan (arrow keys) ---
+    let dt = app.time_delta();
+    if app.keys().pressed(KeyCode::Equal) || app.keys().pressed(KeyCode::NumpadAdd) {
+        model.params.zoom = (model.params.zoom * (1.0 + ZOOM_RATE * dt)).clamp(ZOOM_MIN, ZOOM_MAX);
+        params_changed = true;
+    }
+    if app.keys().pressed(KeyCode::Minus) || app.keys().pressed(KeyCode::NumpadSubtract) {
+        model.params.zoom = (model.params.zoom / (1.0 + ZOOM_RATE * dt)).clamp(ZOOM_MIN, ZOOM_MAX);
+        params_changed = true;
+    }
+    // Pan speed scales with 1/zoom so it feels like a constant on-screen
+    // speed rather than a constant world-space speed (otherwise panning
+    // feels sluggish when zoomed in and way too fast when zoomed out).
+    let pan_step = PAN_SPEED * dt / model.params.zoom;
+    let mut pan = Vec2::ZERO;
+    if app.keys().pressed(KeyCode::ArrowLeft) {
+        pan.x -= pan_step;
+    }
+    if app.keys().pressed(KeyCode::ArrowRight) {
+        pan.x += pan_step;
+    }
+    if app.keys().pressed(KeyCode::ArrowUp) {
+        pan.y += pan_step;
+    }
+    if app.keys().pressed(KeyCode::ArrowDown) {
+        pan.y -= pan_step;
+    }
+    if pan != Vec2::ZERO {
+        let world_w = model.params.half_width * 2.0;
+        let world_h = model.params.half_height * 2.0;
+        // Wrap the camera the same way particles wrap, so panning past an
+        // edge loops back around rather than drifting off into empty space.
+        let wrap = |v: f32, half: f32, full: f32| ((v + half).rem_euclid(full)) - half;
+        model.params.camera_x = wrap(model.params.camera_x + pan.x, model.params.half_width, world_w);
+        model.params.camera_y = wrap(model.params.camera_y + pan.y, model.params.half_height, world_h);
+        params_changed = true;
     }
 
     let randomize_matrix_key = app.keys().just_pressed(KeyCode::KeyR);
     let cycle_preset = app.keys().just_pressed(KeyCode::Space);
     let mut matrix_changed = false;
-    let mut speed_changed = false;
 
-    // --- mouse interaction with the on-screen panel ---
-    let half_w = model.params.half_width;
-    let half_h = model.params.half_height;
+    // --- mouse interaction with the on-screen panel (screen-locked; the
+    // panel never moves or scales with the world camera) ---
+    let half_w = model.params.screen_half_w;
+    let half_h = model.params.screen_half_h;
     let num_types = model.params.num_types;
     let layout = compute_ui_layout(half_w, half_h, num_types);
 
@@ -963,7 +986,7 @@ fn update(app: &App, model: &mut Model) {
         let log_min = SPEED_MULT_MIN.ln();
         let log_max = SPEED_MULT_MAX.ln();
         model.speed_mult = (log_min + t * (log_max - log_min)).exp();
-        speed_changed = true;
+        params_changed = true;
     }
 
     // Value tracks the drag absolutely (start value + offset from the drag's
@@ -987,7 +1010,7 @@ fn update(app: &App, model: &mut Model) {
         model.dragging_cell = None;
     }
 
-    if speed_changed {
+    if params_changed {
         model.params.force_scale = BASE_FORCE_SCALE * model.speed_mult;
         window
             .queue()

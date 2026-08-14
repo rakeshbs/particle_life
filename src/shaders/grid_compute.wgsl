@@ -21,6 +21,14 @@ struct Params {
     grid_rows: u32,
     num_cells: u32,
     max_cell_scan: u32,
+    // Screen/camera fields below are only read by the particle vertex
+    // shader (vs.wgsl), which shares this same Params uniform buffer. They
+    // must stay listed here so the struct's memory layout matches.
+    screen_half_w: f32,
+    screen_half_h: f32,
+    camera_x: f32,
+    camera_y: f32,
+    zoom: f32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;

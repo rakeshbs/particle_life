@@ -21,6 +21,11 @@ struct Params {
     grid_rows: u32,
     num_cells: u32,
     max_cell_scan: u32,
+    screen_half_w: f32,
+    screen_half_h: f32,
+    camera_x: f32,
+    camera_y: f32,
+    zoom: f32,
 };
 
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;
@@ -55,18 +60,37 @@ fn type_color(t: u32) -> vec3<f32> {
     return hsv_to_rgb(hue, 0.85, 1.0);
 }
 
+fn wrap_diff(d_in: f32, half: f32, full: f32) -> f32 {
+    var d = d_in;
+    if (d > half) { d = d - full; }
+    else if (d < -half) { d = d + full; }
+    return d;
+}
+
 @vertex
 fn main(
     @location(0) corner: vec2<f32>,
     @builtin(instance_index) instance: u32,
 ) -> VertexOutput {
     let p = particles[instance];
-    let world_pos = p.pos + corner * params.particle_radius;
+
+    // Wrap the particle's CENTER relative to the camera once, then add the
+    // quad corner offset afterward (in that order). Wrapping each corner
+    // independently would let a particle near the wrap seam have its four
+    // corners resolve to opposite sides of the world, tearing the quad into
+    // a stretched line - with many particles sitting near that seam at any
+    // time, that reads as streaks across the whole screen.
+    let world_w = params.half_width * 2.0;
+    let world_h = params.half_height * 2.0;
+    var rel = p.pos - vec2<f32>(params.camera_x, params.camera_y);
+    rel.x = wrap_diff(rel.x, params.half_width, world_w);
+    rel.y = wrap_diff(rel.y, params.half_height, world_h);
+    rel = rel + corner * params.particle_radius;
 
     var out: VertexOutput;
     out.clip_position = vec4<f32>(
-        world_pos.x / params.half_width,
-        world_pos.y / params.half_height,
+        rel.x * params.zoom / params.screen_half_w,
+        rel.y * params.zoom / params.screen_half_h,
         0.0,
         1.0,
     );
